@@ -18,12 +18,25 @@ https://zenodo.org/records/17084199
 
 """
 
-def build_dataset(is_train, args):
-    stats = normalise.load_stats(args.disease)
-    transform = normalise.build_transform(is_train, stats,, args)
+def get_stats(args):
+    # mean/std always come from the training split only, so val/test never leak into normalisation
+    if args.data_set == 'ADNI':
+        train_paths = [path for path, _ in datasets.ImageFolder(args.data_path).samples]
+        return normalise.compute_stats(train_paths, args.data_set, cache_dir=args.stats_dir,
+                                       target_size=args.input_size)
+    return normalise.load_stats(args.data_set, cache_dir=args.stats_dir)
+
+
+def build_dataset(split, args):
+    # split is one of 'train', 'val' or 'test'
+    is_train = split == 'train'
+    stats = get_stats(args)
+    transform = normalise.build_transform(is_train, stats, img_size=args.input_size, args=args)
 
     if args.data_set == 'ADNI':
-        data_dir = args.data_path if is_train else args.val_data_path
+        data_dir = {'train': args.data_path,
+                    'val': args.val_data_path,
+                    'test': args.eval_data_path}[split]
         dataset = datasets.ImageFolder(data_dir, transform=transform)
         nb_classes = 2
     elif args.data_set == 'CIFAR':
@@ -34,20 +47,3 @@ def build_dataset(is_train, args):
     print("Number of the class = %d" % nb_classes)
 
     return dataset, nb_classes
-
-def build_transform(is_train, args):
-    if is_train:
-        transform = transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        ])
-    return transform

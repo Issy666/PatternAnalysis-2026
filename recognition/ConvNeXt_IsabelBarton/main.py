@@ -3,6 +3,21 @@ import argparse
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import numpy as np
+from pathlib import Path
+from dataset import build_dataset
+import normalise
+
+
+def str2bool(v):
+    # argparse's type=bool treats any non-empty string (including "False") as True
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    if v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
 
 
 def get_args_parser():
@@ -72,8 +87,10 @@ def get_args_parser():
                         help='num of steps to warmup LR, will overload warmup_epochs if set > 0')
 
     # Augmentation parameters
-    parser.add_argument('--aa', type=str, default='rand-m9-mstd0.5-inc1',
-                        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)'),
+    parser.add_argument('--aa', type=str, default='',
+                        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)')
+    parser.add_argument('--color_jitter', type=float, default=0, metavar='PCT',
+                        help='Color jitter factor (default: 0.4)')
     parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
     parser.add_argument('--train_interpolation', type=str, default='bilinear',
@@ -123,16 +140,21 @@ def get_args_parser():
 
     # Dataset parameters
     parser.add_argument('--data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/train', type=str,
-                        help='dataset path')import torch.backends.cudnn as cudnn
-    parser.add_argument('--val_data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/val', type=str,
+                        help='dataset path')
+    parser.add_argument('--val_data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/validation', type=str,
                         help='dataset path')
     parser.add_argument('--eval_data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/test', type=str,
                         help='dataset path for evaluation')
 
-    parser.add_argument('--nb_classes', default=1000, type=int,
+    parser.add_argument('--nb_classes', default=2, type=int,
                         help='number of the classification types')
-    parser.add_argument('--data_set', default='IMNET', choices=['CIFAR', 'ADNI'],
+    parser.add_argument('--data_set', default='ADNI', choices=['CIFAR', 'ADNI'],
                         type=str, help='dataset path')
+    parser.add_argument('--stats_dir', default=normalise.DEFAULT_CACHE_DIR, type=str,
+                        help='where the training-set mean/std JSON is cached')
+    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--pin_mem', type=str2bool, default=True,
+                        help='Pin CPU memory in DataLoader for more efficient transfer to GPU.')
     parser.add_argument('--output_dir', default='/home/isabel/Desktop/results',
                         help='path where to save, empty for no saving')
     parser.add_argument('--log_dir', default='/home/isabel/Desktop/log',
@@ -140,23 +162,23 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-https://github.com/facebookresearch/ConvNeXt/blob/main/main.py
+
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
-    parser.add_argument('--eval', type=bool, default=False,
+    parser.add_argument('--eval', type=str2bool, default=False,
                         help='Perform evaluation only')
-    parser.add_argument('--dist_eval', type=bool, default=True,
+    parser.add_argument('--dist_eval', type=str2bool, default=True,
                         help='Enabling distributed evaluation')
-    parser.add_argument('--disable_eval', type=bool, default=False,
+    parser.add_argument('--disable_eval', type=str2bool, default=False,
                         help='Disabling evaluation during training')
 
     # Weights and Biases arguments
-    parser.add_argument('--enable_wandb', type=bool, default=False,
+    parser.add_argument('--enable_wandb', type=str2bool, default=False,
                         help="enable logging to Weights and Biases")
     parser.add_argument('--project', default='convnext', type=str,
                         help="The name of the W&B project where you're sending the new run.")
-    parser.add_argument('--wandb_ckpt', type=bool, default=False,
+    parser.add_argument('--wandb_ckpt', type=str2bool, default=False,
                         help="Save model checkpoints as W&B Artifacts.")
 
     return parser
@@ -173,12 +195,13 @@ def main(args):
     #enables the NVIDIA cuDNN auto-tuner to test multiple convolution algorithms and select the fastest one for your GPU  Works for inputs that are the same size
     cudnn.benchmark = True
 
-    dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
+    dataset_train, args.nb_classes = build_dataset(split='train', args=args)
     if args.disable_eval:
         args.dist_eval = False
         dataset_val = None
     else:
-        dataset_val, _ = build_dataset(is_train=False, args=args)
+        dataset_val, _ = build_dataset(split='val', args=args)
+    dataset_test, _ = build_dataset(split='test', args=args)
 
     # num_tasks = utils.get_world_size()
     # global_rank = utils.get_rank()
