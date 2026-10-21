@@ -5,6 +5,119 @@
 ## Problem
 
 ## How it Works
+1. Run `main.py` from this directory:
+
+   ```bash
+   python3 main.py
+   ```
+
+   Any of the variables below can be overridden on the command line, e.g.
+
+   ```bash
+   python3 main.py --batch_size 32 --epochs 100 --data_path /path/to/AD_NC/train
+   ```
+
+   These defaults have been fine-tuned to give the best performing model for classifying MRI scans as AD (Alzheimer's disease) or NC (normal control). Boolean flags take a value, e.g. `--model_ema True`.
+
+### Training
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--batch_size` | `64` | Number of images per batch (per GPU). |
+| `--epochs` | `150` | Number of passes over the training set. |
+| `--update_freq` | `1` | Gradient accumulation steps; the effective batch size is `batch_size × update_freq`. |
+| `--start_epoch` | `0` | Epoch to start from (used when resuming training). |
+| `--seed` | `0` | Random seed for reproducibility. |
+| `--device` | `cuda` | Device to train/evaluate on (`cuda` or `cpu`). |
+| `--num_workers` | `4` | Number of DataLoader worker processes for loading images. |
+| `--pin_mem` | `True` | Pin CPU memory in the DataLoader for faster transfer to the GPU. |
+
+### Model
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--model` | `convnext` | Name of the model architecture to train. |
+| `--input_size` | `256` | Height and width (pixels) images are resized to before entering the network. |
+| `--drop_path` | `0` | Stochastic depth rate (randomly drops residual blocks during training for regularisation). |
+| `--layer_scale_init_value` | `1e-6` | Initial value of ConvNeXt's per-channel layer scale parameters. |
+| `--nb_classes` | `2` | Number of output classes (AD and NC). |
+| `--head_init_scale` | `1.0` | Scale applied to the classifier head's initial weights; typically adjusted when fine-tuning. |
+
+### Exponential Moving Average (EMA)
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--model_ema` | `False` | Keep an exponential moving average of the model weights. |
+| `--model_ema_decay` | `0.9999` | Decay rate of the EMA weights. |
+| `--model_ema_force_cpu` | `False` | Store the EMA model on the CPU to save GPU memory. |
+| `--model_ema_eval` | `False` | Also evaluate the EMA model on the validation set during training. |
+
+### Optimisation
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--opt` | `adamw` | Optimiser. |
+| `--opt_eps` | `1e-8` | Optimiser epsilon (numerical stability term). |
+| `--opt_betas` | `None` | Optimiser betas; `None` uses the optimiser's defaults. |
+| `--momentum` | `0.9` | Momentum (only used by the SGD optimiser). |
+| `--clip_grad` | `None` | Maximum gradient norm; `None` disables gradient clipping. |
+| `--lr` | `4e-3` | Peak learning rate. |
+| `--min_lr` | `1e-6` | Lowest learning rate reached by the cosine schedule. |
+| `--warmup_epochs` | `20` | Number of epochs the learning rate linearly warms up to `--lr`. |
+| `--warmup_steps` | `-1` | Number of warm-up steps; overrides `--warmup_epochs` if greater than 0. |
+| `--weight_decay` | `0.05` | Weight decay (L2 regularisation strength). |
+| `--weight_decay_end` | `None` | Final weight decay for the cosine weight decay schedule; `None` keeps it constant. |
+| `--layer_decay` | `1.0` | Layer-wise learning rate decay; `1.0` gives every layer the same learning rate. |
+
+### Augmentation and Regularisation
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--aa` | `''` (off) | AutoAugment/RandAugment policy, e.g. `rand-m9-mstd0.5-inc1`. |
+| `--color_jitter` | `0` (off) | Strength of random brightness/contrast/saturation changes. |
+| `--train_interpolation` | `bilinear` | Interpolation used when resizing training images (`random`, `bilinear`, `bicubic`). |
+| `--smoothing` | `0.1` | Label smoothing applied to the loss. |
+| `--reprob` | `0.25` | Probability of applying random erasing to a training image. |
+| `--remode` | `pixel` | Random erasing mode (what the erased region is filled with). |
+| `--recount` | `1` | Number of regions erased per image. |
+| `--crop_pct` | `None` | Centre crop ratio used at evaluation time. |
+
+### Mixup and CutMix
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--mixup` | `0.8` | Mixup alpha; mixup is enabled if > 0. |
+| `--cutmix` | `1.0` | CutMix alpha; CutMix is enabled if > 0. |
+| `--cutmix_minmax` | `None` | CutMix min/max box ratio; overrides `--cutmix` alpha if set. |
+| `--mixup_prob` | `1.0` | Probability of applying mixup or CutMix to a batch. |
+| `--mixup_switch_prob` | `0.5` | Probability of using CutMix instead of mixup when both are enabled. |
+| `--mixup_mode` | `batch` | Granularity of mixup/CutMix parameters: per `batch`, `pair` or `elem`. |
+
+### Data
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--data_set` | `ADNI` | Dataset to use (`ADNI` or `CIFAR`). |
+| `--data_path` | `/home/isabel/Desktop/data/ADNI/AD_NC/train` | Training images (folder containing `AD/` and `NC/`). |
+| `--val_data_path` | `/home/isabel/Desktop/data/ADNI/AD_NC/validation` | Validation images, used for checkpoint selection and tuning. |
+| `--eval_data_path` | `/home/isabel/Desktop/data/ADNI/AD_NC/test` | Held-out test images, used for the final reported result. |
+| `--stats_dir` | `stats/` (next to `normalise.py`) | Where the training-set mean/std used for normalisation is cached. |
+
+### Checkpoints, Evaluation and Logging
+
+| Argument | Default | Purpose |
+|---|---|---|
+| `--output_dir` | `/home/isabel/Desktop/results` | Where checkpoints and logs are saved; empty for no saving. |
+| `--log_dir` | `/home/isabel/Desktop/log` | Where TensorBoard logs are written. |
+| `--finetune` | `''` | Path or URL of a checkpoint to fine-tune from. |
+| `--model_key` | `model\|module` | Key(s) to look for in the checkpoint's state dict. |
+| `--model_prefix` | `''` | Prefix to strip from checkpoint parameter names when loading. |
+| `--eval` | `False` | Only evaluate a trained model (no training). |
+| `--disable_eval` | `False` | Skip validation during training. |
+| `--dist_eval` | `True` | Use distributed evaluation across multiple GPUs. |
+| `--enable_wandb` | `False` | Log to Weights & Biases. |
+| `--project` | `convnext` | Weights & Biases project name. |
+| `--wandb_ckpt` | `False` | Upload checkpoints to Weights & Biases as artifacts. |
 
 -----------------------------------------------------
 
