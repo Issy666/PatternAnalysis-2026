@@ -255,14 +255,36 @@ For example, a pixel with channel values `[2, 4, 6]` has mean 4 and standard dev
 | Argument | Default | Purpose |
 |---|---|---|
 | `--batch_size` | `64` | Number of images per batch (per GPU). |
-| `--epochs` | `150` | Number of passes over the training set. |
+| `--epochs` | `60` | Number of passes over the training set (see [Learning rate schedule](#learning-rate-schedule)). |
 | `--update_freq` | `1` | Gradient accumulation steps; the effective batch size is `batch_size × update_freq`. |
 | `--start_epoch` | `0` | Epoch to start from (used when resuming training). |
 | `--seed` | `0` | Random seed for reproducibility. |
 | `--device` | `cuda` | Device to train/evaluate on (`cuda` or `cpu`). |
 | `--num_workers` | `4` | Number of DataLoader worker processes for loading images. |
 | `--pin_mem` | `True` | Pin CPU memory in the DataLoader for faster transfer to the GPU. |
-| `--use_amp` | `True` | Automatic mixed precision (float16 where safe); much faster on an RTX GPU. |
+
+#### Mixed precision (AMP) and loss scaling
+
+Training always uses automatic mixed precision (AMP), so `main.py` requires a CUDA GPU and stops with a message otherwise. The forward pass runs inside `torch.amp.autocast('cuda')` (`train.py`), so most of the maths is done in **float16** instead of float32. On an RTX GPU this is much faster and uses about half the memory. There is no full-precision training option. `evaluate` keeps a `use_amp` switch so that `predict.py` can score a trained model on a CPU in float32.
+
+**The problem.** float16 has a very limited range. Its smallest normal value is about 6e-5, and many gradients are smaller than that. In float16 they round to 0 (*underflow*), and those weights stop learning.
+
+**The loss scaler.** `NativeScaler` in `main.py` is `NativeScalerWithGradNormCount` (`utils.py`), a wrapper around PyTorch's `GradScaler`. Each training step it:
+1. **Scales up:** multiplies the loss by a large factor (starting at 65,536) before `backward()`. By the chain rule, every gradient is multiplied by the same factor, lifting tiny gradients above float16's limit.
+2. **Unscales:** divides the gradients back to their true size before the optimiser uses them.
+3. **Measures:** computes the gradient norm (`grad_norm` in the training log), and clips the gradients if `--clip_grad` is set.
+4. **Steps safely:** checks for `inf` or `NaN` gradients. If the factor was too large and a gradient overflowed, that update is **skipped** instead of corrupting the weights.
+5. **Adjusts:** halves the factor after an overflow and slowly raises it again after many successful steps, settling on the largest factor that is safe.
+
+This can be seen at the start of the first run's log:
+
+```
+Epoch: [0]  [ 10/571]  ...  grad_norm: 16.8804 (inf)
+```
+
+The running average of `grad_norm` is `inf` because the starting factor of 65,536 overflowed in the first few steps. Those updates were skipped and the factor was reduced. This is normal and harmless.
+
+The scaler's current factor is saved in each checkpoint and restored with `--auto_resume`.
 
 ### Model
 
@@ -310,25 +332,174 @@ Starting at `1e-6` means each branch adds almost nothing at first, so the 18-blo
 | Argument | Default | Purpose |
 |---|---|---|
 | `--model_ema` | `False` | Keep an exponential moving average of the model weights. |
-| `--model_ema_decay` | `0.9999` | Decay rate of the EMA weights. |
+| `--model_ema_decay` | `0.9997` | Decay rate of the EMA weights (paper: `0.9999`; see below). |
 | `--model_ema_force_cpu` | `False` | Store the EMA model on the CPU to save GPU memory. |
 | `--model_ema_eval` | `False` | Also evaluate the EMA model on the validation set during training. |
+
+EMA keeps a **second copy of the model** whose weights are a slow running average of the trained weights. The real model is trained as normal. After every optimizer step (`train.py`), the EMA copy is updated:
+
+```
+ema_weights = decay × ema_weights + (1 − decay) × current_weights
+```
+
+The EMA copy is never trained directly, so it changes slowly and smooths out the step-to-step noise in the weights. An averaged model often generalises slightly better than the weights from any single step. With `--model_ema_eval True`, the EMA copy is also evaluated on validation every epoch and its best version is saved as `checkpoint-best-ema.pth`.
+
+**Why it could help on ADNI.** In the first from-scratch run, validation accuracy jumped between about 73% and 78% from epoch to epoch. The best checkpoint (80.9% validation) reached only 67.4% on test, which suggests it was a lucky peak. Because an EMA model changes slowly, its validation curve is smoother, and its best checkpoint is a more reliable choice.
+
+**Why the default decay is 0.9997, not the paper's 0.9999.** An EMA averages over roughly `1 / (1 − decay)` optimizer steps. What matters is how long that window is compared with the whole training run:
+
+| | ImageNet (paper) | ADNI, decay 0.9999 | ADNI, decay 0.9997 |
+|---|---|---|---|
+| Optimizer steps per epoch | ~313 (1.28 M images, batch 4096) | 285 (571 batches of 32, `update_freq 2`) | 285 |
+| Epochs | 300 | 100 | 100 |
+| Averaging window | 10,000 steps ≈ 32 epochs | 10,000 steps ≈ 35 epochs | 3,333 steps ≈ 12 epochs |
+| Share of training | **~11%** | **35%** | **~12%** |
+| Random initial weights left at the end | ≈ 0% | **≈ 6%** (0.9999^28,500) | ≈ 0.02% |
+
+The EMA starts from the random initial weights. With the paper's 0.9999, the ADNI run is too short for the average to forget them: about 6% of the final EMA would still be random initial weights, and it would lag about a third of the run behind the trained model. 0.9997 keeps the same proportion as the paper (an averaging window of about 11–12% of training). EMA stays **off by default** (`--model_ema False`) because it hasn't been tested on ADNI yet. To try it:
+
+```bash
+python3 main.py --model_ema True --model_ema_eval True
+```
 
 ### Optimisation
 
 | Argument | Default | Purpose |
 |---|---|---|
-| `--opt` | `adamw` | Optimiser. |
-| `--opt_eps` | `1e-8` | Optimiser epsilon (numerical stability term). |
-| `--opt_betas` | `None` | Optimiser betas; `None` uses the optimiser's defaults. |
-| `--momentum` | `0.9` | Momentum (only used by the SGD optimiser). |
+| `--opt_eps` | `1e-8` | AdamW epsilon (numerical stability term). |
+| `--opt_betas` | `None` | AdamW betas; `None` uses PyTorch's defaults `(0.9, 0.999)`. |
 | `--clip_grad` | `None` | Maximum gradient norm; `None` disables gradient clipping. |
-| `--lr` | `4e-3` | Peak learning rate. |
+| `--lr` | `5e-4` | Peak learning rate (see below). |
 | `--min_lr` | `1e-6` | Lowest learning rate reached by the cosine schedule. |
-| `--warmup_epochs` | `20` | Number of epochs the learning rate linearly warms up to `--lr`. |
+| `--warmup_epochs` | `5` | Number of epochs the learning rate linearly warms up to `--lr`. |
 | `--warmup_steps` | `-1` | Number of warm-up steps; overrides `--warmup_epochs` if greater than 0. |
 | `--weight_decay` | `0.05` | Weight decay (L2 regularisation strength). |
 | `--weight_decay_end` | `None` | Final weight decay for the cosine weight decay schedule; `None` keeps it constant. |
+
+**Batch size and learning rate.** The default batch is 64 images per optimizer step (`--batch_size 64 --update_freq 1`). This fits on the RTX 3080 (about 6.5 GB). Gradient accumulation (`--update_freq` > 1) is only needed if a batch doesn't fit in GPU memory. ConvNeXt uses LayerNorm, which treats each image independently, so 2 batches of 32 accumulated give the same gradient as 1 batch of 64, only slower.
+
+The paper's learning rate of `4e-3` is for a batch of 4096, so it has to be scaled down for a batch of 64:
+- Linear scaling (the paper's rule) gives 4e-3 × 64 / 4096 = 6.25e-5.
+- Square-root scaling, often used with Adam-type optimisers, gives 4e-3 × √(64 / 4096) = **5e-4**.
+
+`5e-4` is the starting default. It hasn't been tuned on ADNI yet, and a learning-rate sweep (e.g. 2.5e-4, 5e-4, 1e-3, 2e-3 with everything else fixed) is the next planned experiment.
+
+#### Learning rate schedule
+
+`utils.cosine_scheduler` builds a list with one learning rate per optimizer step for the whole run (epochs × steps per epoch, e.g. 60 × 285 = 17,100). Every step, `train.py` sets the optimiser's learning rate from it.
+
+1. **Linear warmup** (`--warmup_epochs`): the LR rises in a straight line from 0 to `--lr`. With random starting weights, the first gradients are large and unreliable, and Adam's running averages start at zero. A full-size LR straight away could push the weights somewhere bad that the model never recovers from. This matters more here than in fine-tuning, because the model is trained from scratch.
+2. **Cosine decay** (the rest of the run): `min_lr + 0.5 × (lr − min_lr) × (1 + cos(π × i / N))`, where `i` counts steps since the end of warmup and `N` is the number of steps left after warmup. The LR falls slowly at first, fastest in the middle, and slowly again as it reaches `--min_lr` (1e-6) at the last step. Early on, a high LR takes big exploring steps. Near the end, a low LR takes small steps that settle the weights into a good minimum. Only the peak `--lr` needs tuning. The paper uses the same schedule [1].
+
+A schedule that lowers the LR when validation stops improving (ReduceLROnPlateau) is not used, because ADNI validation accuracy jumps by about ±3% between epochs, and the schedule would react to noise.
+
+**Why 60 epochs and 5 warmup epochs.** Cosine ties the LR to the total run length, so the number of epochs decides *when* the low-LR settling phase happens. In the first from-scratch run (100 epochs, 10 warmup), validation stopped improving after about epoch 30 and peaked at epoch 55 (80.9%), while the LR was still about half its peak. By the low-LR end, the model had already started overfitting, and validation finished at 76.7%. Shortening the run to 60 epochs makes the decay finish around where the model stopped improving, so the final, most settled weights are also the best ones. 5 warmup epochs is about 8% of the run, close to the paper's 20 of 300 epochs (7%). The 60 epochs will be checked by the learning-rate sweep, which uses these defaults.
+
+#### Weight decay schedule
+
+```python
+if args.weight_decay_end is None:
+    args.weight_decay_end = args.weight_decay
+wd_schedule_values = utils.cosine_scheduler(
+    args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+```
+
+**What weight decay does.** Each step, AdamW shrinks every decayed weight slightly towards 0:
+
+```
+w ← w − lr × weight_decay × w
+```
+
+This stops weights from growing large to memorise individual training images, so it acts as a regulariser against overfitting. It applies only to the `decay` parameter group (conv and Linear weights). Every step, `train.py` sets the scheduled value only on groups whose weight decay is already above 0, so biases, LayerNorm parameters and `gamma` stay at 0 (see [Parameter groups](#optimiser-adamw)).
+
+**The schedule.** `main.py` uses the same cosine function as the learning rate, without warmup, to give one weight decay value per step. By default `--weight_decay_end` is `None`, so the end value is set equal to the start value. The "cosine" from 0.05 to 0.05 is then a flat line: weight decay is a constant **0.05**, as in the paper [1]. The startup log confirms this with `Max WD = 0.0500000, Min WD = 0.0500000`. Because the update is multiplied by `lr`, the actual amount of shrinking still follows the learning rate schedule: it ramps up during warmup and fades during the cosine decay.
+
+**When it would change.** Setting `--weight_decay_end` makes weight decay follow a cosine curve between the two values. For example, `--weight_decay 0.04 --weight_decay_end 0.4` increases it over training, which some later self-supervised work (e.g. DINO) uses to regularise more strongly towards the end. ConvNeXt keeps it constant, so it's left off here.
+
+**For ADNI.** 0.05 is the paper's value for ImageNet, which has 1.28 M images. The first from-scratch ADNI run overfitted, so a constant but higher weight decay (e.g. `--weight_decay 0.1`) is a simpler next step than scheduling it. Like the other regularisation experiments, it should be tested after the learning rate sweep, because the strength of weight decay depends on `lr` (`lr × weight_decay`).
+
+#### Optimiser: AdamW
+
+The optimiser is always **AdamW** (`optim_factory.py`). The original repository's `optim_factory.py` could build about 20 optimisers. It has been cut down to AdamW only, and the `--opt` and `--momentum` arguments were removed.
+
+**Why AdamW.**
+- **ConvNeXt was designed and tuned with it.** The paper trains every model with AdamW [1], and its other settings (layer scale, LayerNorm, warmup + cosine schedule, weight decay 0.05) were chosen together with it. Switching optimiser would mean re-tuning all of them.
+- **Adaptive step size per weight.** Adam keeps running averages of each weight's gradient (momentum) and squared gradient, and divides the step by the square root of the second one. Weights with consistently large gradients take smaller steps, and weights with small gradients take larger ones. This matters for ConvNeXt, whose parameters have very different scales: 7×7 depthwise filters, large Linear layers, and layer scale `gamma` values that start at 1e-6. Plain SGD uses one step size for every weight, which is why Transformer-style models such as ConvNeXt train poorly with it.
+- **Decoupled weight decay (the "W").** In plain Adam, weight decay is added to the gradient and then divided by the adaptive scaling, so it ends up weaker for some weights than others. AdamW shrinks the weights directly, separate from the gradient step, so `--weight_decay 0.05` acts as a consistent regulariser. This matters on ADNI because the first run overfitted.
+- **Other optimisers don't suit this setup.** LAMB and LARS are designed for batches in the thousands, and SGD would undo the paper's tuning. For this project, the learning rate and weight decay *used with* AdamW matter more than the choice of optimiser.
+
+**Parameter groups (`get_parameter_groups`).** Every learnable tensor in the model is put in one of two groups:
+
+| Group | Which parameters | Weight decay | Tensors (ConvNeXt-T) |
+|---|---|---|---|
+| `decay` | Conv and Linear weights (2-D or more) | `--weight_decay` (0.05) | 59 |
+| `no_decay` | Biases, LayerNorm weights and biases, layer scale `gamma` (all 1-D) | 0 | 123 |
+
+Weight decay pulls weights towards 0. That is useful on the conv and Linear weights, which hold what the network has learned and are where overfitting happens. It would be harmful on the 1-D parameters: LayerNorm scales start at 1 and `gamma` controls how much each block contributes, so shrinking them would interfere with the network's normalisation and layer scaling. Biases only shift values and add very little capacity. This is the standard practice used by the paper's code. Because each group sets its own weight decay, AdamW's global `weight_decay` is set to 0.
+
+Each group also carries `lr_scale = 1`, so every layer uses the full learning rate. Every step, `train.py` sets each group's learning rate to the schedule value × `lr_scale`. The `lr` passed to AdamW is only the starting value.
+
+### Training Loop (`train.py`)
+
+`main.py` calls `train_one_epoch` once per epoch. Each call makes one pass over the training set and returns that epoch's average metrics, which are written to `log.txt`. After each epoch, `main.py` calls `evaluate` on the validation set and saves `checkpoint-best.pth` if validation accuracy improved.
+
+**Setup.** `model.train(True)` puts the model in training mode. In ConvNeXt, the only layer that behaves differently in training is DropPath, which randomly skips blocks only during training. `evaluate` calls `model.eval()`, so every block always runs at validation and test time. A `MetricLogger` keeps running averages of the loss, accuracy, learning rate and gradient norm, and prints a progress line to `train.log` every 10 batches:
+
+```
+Epoch: [0]  [ 10/571]  eta: 0:03:47  lr: 0.000001  loss: 0.7665 (0.7708)  class_acc: 0.5000 (0.5227) ...
+```
+
+The value in brackets is the average so far in that epoch. The learning rate is shown as its current value instead of an average. `optimizer.zero_grad()` clears any leftover gradients before the first batch, because PyTorch adds new gradients to existing ones instead of replacing them.
+
+**Batches and steps.** The training loader shuffles the slices every epoch and gives batches of 64 slices, shaped `(64, 3, 256, 256)` with labels `(64,)` (0 = AD, 1 = NC). It uses `drop_last=True`, so 18,300 slices give 285 full batches, and the last 60 slices (different ones each epoch, because of shuffling) are skipped. Each batch is one optimizer step, because `--update_freq` is 1. With gradient accumulation, `update_freq` batches would make up one step instead. The global step number `it = epoch × 285 + step` is the position in the learning rate and weight decay schedules. Because `it` is computed from the epoch, a resumed run continues the schedules from the right point.
+
+**Applying the schedules.** At the start of each step, the learning rate of both parameter groups is set to `lr_schedule[it]` (times `lr_scale`, which is always 1), and the weight decay of the `decay` group is set to `wd_schedule[it]`. The `no_decay` group stays at 0. Updating every step instead of every epoch makes the 5-epoch warmup a smooth ramp over 1,425 steps, instead of 5 large jumps.
+
+**Forward pass and loss.** Each batch is copied from the CPU to the GPU with `non_blocking=True`. With pinned memory (`--pin_mem True`), this lets the copy overlap with GPU work. The model returns `(64, 2)` **logits**, raw scores for AD and NC that softmax would turn into probabilities. With AMP, the forward pass and the loss run inside `autocast`, which uses float16 for convolutions and matrix multiplies and float32 for precision-sensitive steps such as softmax, LayerNorm and the loss. The weights themselves stay in float32 (see [Mixed precision (AMP) and loss scaling](#mixed-precision-amp-and-loss-scaling)). The loss is the label-smoothing cross-entropy averaged over the batch. If it is ever `inf` or `NaN`, training has diverged, usually because the learning rate is too high, and the run stops immediately instead of writing useless checkpoints for the rest of the night. During the learning-rate sweep, a run that stops this way shows that its learning rate is too high.
+
+**Backward pass and weight update.** The backward pass uses the chain rule to compute, for every weight, how much changing it would change the loss (its gradient), working backwards from the loss through the head, the 18 blocks and the stem. Gradients are **added** into each weight's `.grad`. A single call to the AMP loss scaler does the scaled backward pass, unscales the gradients, measures (and, with `--clip_grad`, clips) the total gradient size `grad_norm`, and takes the AdamW step, skipping it if any gradient is `inf` or `NaN`. AdamW then updates every weight using its gradient, its running averages, the learning rate and the weight decay. `optimizer.zero_grad()` clears the gradients after each step. If the EMA is enabled, its copy moves slightly towards the new weights.
+
+**Gradient accumulation.** With `--update_freq N`, the optimizer only steps on every N-th batch, and `zero_grad()` is not called in between, so the gradients of the N batches add up. Each batch's loss is divided by N first, so the summed gradient equals the gradient of the average loss, the same as one batch N times larger. This only matters when a batch doesn't fit in GPU memory. The default is `--update_freq 1`, so every batch is one step.
+**Logging.** After each step, the loop records the batch loss, the batch training accuracy (the fraction of slices whose highest logit matches the label), the learning rate, the weight decay of the `decay` group and `grad_norm`, the total gradient size before clipping. `grad_norm` is useful in the learning-rate sweep, because large spikes indicate a learning rate that is too high. The same values go to TensorBoard every step if `--log_dir` is set. The logged `min_lr` is the smallest learning rate across the parameter groups, a leftover from layer-wise learning-rate decay in the original repository. Both groups now use the same rate, so it always equals `lr`, and it is not the same as `--min_lr`. At the end of the epoch, `train_one_epoch` returns the epoch averages, which `main.py` writes to `log.txt` as `train_loss`, `train_class_acc` and so on, and `plot_log.py` plots.
+
+**Training accuracy understates the overfitting gap.** It is measured in training mode (DropPath randomly skips blocks) on augmented images (random crops and random erasing), and averaged over an epoch in which the weights keep changing. Evaluated in `eval` mode on the same images, the model would score higher. So when training accuracy is 85% and validation is 77%, the real gap between how well the model fits the training data and how well it generalises is larger than 8 points.
+
+`torch.cuda.synchronize()` waits for the GPU to finish each batch so the logged timings are correct.
+
+**Evaluation (`evaluate`).** The same function scores both splits:
+- the **validation** set after every epoch, to choose `checkpoint-best.pth` and log validation metrics;
+- the **test** set once at the end (through `run_test`), on the best checkpoint.
+
+The validation set is used for decisions, so it slowly becomes tuned to. The test set is scored only once, on a checkpoint already chosen on validation, so its result is an honest estimate on unseen patients.
+
+`evaluate` runs under `@torch.no_grad()`, so no gradients are tracked, which saves memory and time. It also calls `model.eval()`, so DropPath is off and every block runs. The validation and test loaders aren't shuffled and keep the final smaller batch, so every slice is scored once. Loss and accuracy are both weighted by batch size, so the averages are exact per-slice values. The original code gave the last batch's loss the same weight as a full batch, which slightly skewed validation and test loss. This was fixed.
+
+The loss here is **plain cross-entropy without label smoothing**, unlike training. It measures the model's real probabilities, which is what calibration needs. But it means training and validation loss aren't measured the same way: training loss can't go below about 0.20 because of smoothing, while validation loss can reach 0. This is partly why validation loss sits *below* training loss in the first run, which does not mean the model does better on unseen data. **Accuracy curves, not loss curves, should be used to judge overfitting.**
+
+For each slice, softmax turns the 2 logits into probabilities that add up to 1, converted to float32 first so values near 0 or 1 stay precise. These are the confidence scores for the open research dilemma, returned in loader order, which matches the file list in `test_predictions.csv` because the loaders don't shuffle. The predicted class is the argmax, which is the same as a 0.5 threshold on `prob_AD`. Moving this threshold is one way to favour AD recall.
+
+**Metrics (`binary_metrics`).** AD is the positive class (the condition being detected). It is class 0 because `ImageFolder` numbers the class folders alphabetically (`AD`, `NC`). From the predictions and labels, the confusion matrix is built. With the first from-scratch run's test results:
+
+| | Predicted AD | Predicted NC |
+|---|---|---|
+| **Really AD** (4,460) | TP = 2,076 (caught) | **FN = 2,384** (missed Alzheimer's) |
+| **Really NC** (4,540) | FP = 549 (false alarm) | TN = 3,991 (correctly cleared) |
+
+| Metric | Formula | Question it answers | First run (test) |
+|---|---|---|---|
+| AD recall (sensitivity) | TP / (TP + FN) | Of all real AD slices, how many were caught? | 46.5% |
+| NC recall (specificity) | TN / (TN + FP) | Of all real NC slices, how many were cleared? | 87.9% |
+| AD precision | TP / (TP + FP) | When the model says AD, how often is it right? | 79.1% |
+| NC precision | TN / (TN + FN) | When the model says NC, how often is it right? | 62.6% |
+| Macro-F1 | mean of AD F1 and NC F1 | Overall balance of precision and recall, both classes weighted equally | 0.659 |
+
+F1 is the harmonic mean of precision and recall, so it is only high when both are. A safe division returns 0 instead of crashing if a class is never predicted.
+
+**AD recall is the key metric.** The acceptance criterion is AD recall ≥ NC recall, because missing Alzheimer's (a false negative) is worse than a false alarm. The first run fails it clearly: it misses more than half of the AD slices and leans towards predicting NC.
+
+Two caveats:
+- **These are slice-level metrics.** Each patient contributes 20 slices, which aren't independent, so one patient can produce up to 20 errors. Patient-level results (averaging each patient's 20 `prob_AD` values before thresholding) are the clinically meaningful version, and will be computed in `predict.py` from `test_predictions.csv`.
+- **All of these use the 0.5 threshold.** Lowering the AD threshold (e.g. predicting AD when `prob_AD > 0.3`) trades false negatives for false positives, raising AD recall and lowering NC recall. The threshold must be chosen on the validation set and reported once on test.
 
 ### Augmentation and Regularisation
 
@@ -343,16 +514,49 @@ Starting at `1e-6` means each branch adds almost nothing at first, so the 18-blo
 | `--recount` | `1` | Number of regions erased per image. |
 | `--crop_pct` | `None` | Centre crop ratio used at evaluation time. |
 
-### Mixup and CutMix
+#### Loss function
 
-| Argument | Default | Purpose |
-|---|---|---|
-| `--mixup` | `0.8` | Mixup alpha; mixup is enabled if > 0. |
-| `--cutmix` | `1.0` | CutMix alpha; CutMix is enabled if > 0. |
-| `--cutmix_minmax` | `None` | CutMix min/max box ratio; overrides `--cutmix` alpha if set. |
-| `--mixup_prob` | `1.0` | Probability of applying mixup or CutMix to a batch. |
-| `--mixup_switch_prob` | `0.5` | Probability of using CutMix instead of mixup when both are enabled. |
-| `--mixup_mode` | `batch` | Granularity of mixup/CutMix parameters: per `batch`, `pair` or `elem`. |
+Training uses cross-entropy with **label smoothing** (`--smoothing 0.1`, as in the paper [1]). The target for each slice is softened from a hard label to:
+
+```
+hard target:     [1.00 AD, 0.00 NC]
+smoothed target: [0.95 AD, 0.05 NC]      (0.9 × one-hot + 0.1 × uniform [0.5, 0.5])
+```
+
+The model is penalised for pushing its outputs to extreme confidence, which reduces overfitting. Two side effects matter for this project:
+- The lowest possible training loss is about 0.20, not 0, so the training loss should be read against that floor.
+- Smoothing changes the model's **confidence**, which is what the open research dilemma measures. It usually reduces over-confidence, but it also trains the model to stay at or below about 95% confidence, which can make it under-confident on easy cases. The reliability diagram should be read with this in mind. With `--smoothing 0`, plain cross-entropy is used instead.
+
+**Planned experiment: smoothing 0.1 vs 0.** Label smoothing is kept at the paper's 0.1 for now, but whether it suits this project is an open question, because it acts directly on the model's confidence:
+- **For:** the first from-scratch run overfitted, and smoothing is a cheap regulariser. It also tends to improve calibration by pulling an over-confident network's confidence down towards its real accuracy [10].
+- **Against:** the research question is not only whether confidence is calibrated overall, but whether it can **separate** the cases the model gets right from the ones it gets wrong, so uncertain slices can be routed to a specialist with a reject threshold (*selective classification*). Smoothing trains every slice towards the same 0.95 target, easy or hard, which can squeeze confidence values together and make that separation weaker. Xia et al. [11] found that label smoothing makes rejecting low-confidence predictions less effective across many tasks and architectures. It pushes down the top output more on predictions that are likely correct than on ones that are likely wrong, which mixes up their confidence ranking. With only 2 classes, the 0.95 cap is relatively close to the 0.5 decision boundary, so the effect may be larger than on ImageNet.
+
+After the learning-rate sweep, the model will be trained twice, changing only `--smoothing` (0.1 and 0), and compared on the test set:
+
+| Metric | What it shows |
+|---|---|
+| Test accuracy, AD recall | Overall performance and the acceptance criteria |
+| Train vs validation accuracy gap | Whether smoothing reduces overfitting |
+| Expected calibration error (ECE), reliability diagram | Whether confidence matches accuracy overall |
+| Accuracy after rejecting the least-confident 20% (accuracy vs rejection-rate curve) | Whether confidence separates right from wrong predictions |
+
+Either result answers part of the open research dilemma: whether a standard ImageNet regulariser helps or hurts the model's ability to know when it is unsure. If smoothing gives better accuracy but worse rejection, Xia et al. [11] propose normalising the logits after training to recover the rejection performance. Temperature scaling fitted on the validation set is a common way to fix calibration.
+
+### Why mixup and CutMix are not used
+
+The paper trains with **mixup** (0.8) and **CutMix** (1.0) [1]. Both were removed from this project's code: the `--mixup` and `--cutmix` arguments, the `Mixup` batch transform and the soft-target loss.
+
+- **Mixup** blends two images pixel by pixel, e.g. 70% of one slice + 30% of another, and gives the label in the same proportion (`[0.7 AD, 0.3 NC]`).
+- **CutMix** pastes a rectangle from one image onto another, and sets the label by area (e.g. a patch covering 20% of the image gives `[0.8, 0.2]`).
+
+These work on ImageNet, where the label describes a whole object, objects sit at different positions, and a picture that is "70% dog, 30% cat" is still a sensible training target. They don't suit ADNI:
+
+1. **The label depends on small, specific regions, not the whole image.** AD versus NC is decided by subtle anatomy: atrophy of the hippocampus and medial temporal lobe, enlarged ventricles and cortical thinning. With CutMix, the area-based label doesn't follow that evidence. If a patch carrying an AD brain's hippocampus is pasted onto an NC slice, the decisive region is now AD, but the label says 20% AD. A patch that lands on the black background changes the label while adding no brain at all, and ADNI slices have a lot of black background.
+2. **Blended brains aren't real brains.** The slices are all centred and aligned in the same way, so mixup doesn't put two separate objects side by side. It overlaps two sets of ventricles and cortex in the same place, giving an anatomically impossible image. Alzheimer's is also not a linear mix: a 70/30 pixel blend of an AD and an NC brain does not look like a brain that is "70% Alzheimer's". The soft label teaches a relationship that doesn't exist.
+3. **They interfere with the research question.** Mixup and CutMix train the model towards soft targets, which changes how confident it is. This project studies whether the model's own confidence is reliable, so the labels are kept clean: each slice keeps its true diagnosis (only softened by the standard label smoothing above).
+4. **Training accuracy can be measured.** With mixed labels, training accuracy can't be computed, so it was not logged. Without them, `train.py` logs training accuracy every step, which the overfitting analysis (training vs validation accuracy) depends on.
+
+Overfitting is handled instead by regularisation that keeps each slice's anatomy and label intact: label smoothing, random erasing (`--reprob 0.25`), drop path, weight decay and, optionally, EMA.
 
 ### Data
 
@@ -377,6 +581,52 @@ Starting at `1e-6` means each branch adds almost nothing at first, so the 18-blo
 | `--auto_resume` | `True` | Resume from the latest checkpoint in `--output_dir` if one exists. |
 | `--eval` | `False` | Only evaluate a trained model on the test set (no training). |
 | `--disable_eval` | `False` | Skip validation during training. |
+
+#### Resuming a run
+
+Before training starts, `utils.auto_load_model` checks for a checkpoint to continue from. With `--auto_resume True` and no `--resume` path, it loads the highest-numbered `checkpoint-<epoch>.pth` in `--output_dir`. `checkpoint-best.pth` is skipped, because "best" isn't an epoch number. It restores everything needed to continue exactly where training stopped:
+
+| Restored | Why |
+|---|---|
+| Model weights | What has been learned so far |
+| AdamW state | The running gradient averages; without them the adaptive step sizes would restart and jolt training |
+| `start_epoch` (saved epoch + 1) | The loop and the learning rate schedule continue from the right point instead of warming up again |
+| EMA weights | If `--model_ema` is on |
+| AMP loss scale | So it doesn't have to search for a safe scale factor again |
+
+This makes `run_overnight.sh` restart-safe: after a crash or reboot, running the same command continues each run. **Each run needs its own `--output_dir`.** Reusing the folder of a longer run (e.g. checkpoints up to epoch 99 with `--epochs 60`) resumes at epoch 100, so the training loop is empty and nothing is trained, with no error.
+
+Checkpoints are loaded with `weights_only=False`, because they also store the arguments and optimizer state, which PyTorch 2.6+ won't load by default. This is only safe for checkpoints you saved yourself: loading an untrusted `.pth` file this way can run arbitrary code.
+
+#### Testing and evaluation-only mode
+
+At the end of training, the best validation checkpoint (`checkpoint-best.pth`) is evaluated **once** on the held-out test set by `run_test`. The test set is never used for choosing checkpoints or tuning. To test an already-trained model without training again:
+
+```bash
+python3 main.py --eval True \
+  --resume ~/Desktop/results/convnext_t_scratch/checkpoint-best.pth \
+  --output_dir ~/Desktop/results/convnext_t_scratch_eval
+```
+
+`run_test` runs the model on all 9,000 test slices and saves 2 files to `--output_dir`:
+
+| File | Contents |
+|---|---|
+| `test_results.json` | Accuracy, loss, AD/NC recall and precision, macro-F1, the confusion matrix counts (TP, FN, FP, TN) and which checkpoint was tested |
+| `test_predictions.csv` | One row per slice: path, true label, predicted label, and the softmax probability for each class |
+
+```
+path,label,pred,prob_AD,prob_NC
+.../AD_NC/test/AD/1003730_100.jpeg,AD,NC,0.075517,0.924483
+```
+
+This row, from the first from-scratch run, is an AD slice that the model called NC with 92% confidence. It is exactly the kind of confident mistake the open research dilemma looks for.
+
+`test_predictions.csv` is the raw material for the open research dilemma. The reliability diagram, calibration error, reject threshold and patient-level predictions (averaging each patient's 20 slices) can all be computed from it without running the model again.
+
+Two things to watch:
+- **Always pass `--resume .../checkpoint-best.pth`.** Without it, `--auto_resume` loads the *latest* epoch checkpoint, not the best one. If no checkpoint is found, the random initial weights are tested (about 50% accuracy) and recorded as `initial weights`.
+- **Use a new `--output_dir`.** Evaluating into the training run's folder overwrites its `test_results.json`, which also records the training time and best validation accuracy.
 
 -----------------------------------------------------
 
@@ -643,3 +893,7 @@ The similar convolution concepts and datasets make this a viable fallback, espec
 [8] M. Basereh *et al.*, "ConvNeXt-driven detection of Alzheimer's disease: A benchmark study on expert-annotated AlzaSet MRI dataset across anatomical planes," bioRxiv preprint, Jul. 2025, doi: 10.1101/2025.07.10.664260. [Online]. Available: https://www.biorxiv.org/content/10.1101/2025.07.10.664260v1.full
 
 [9] M. Basereh, "AlzaSet: MRI dataset for 'ConvNeXt-driven Alzheimer's detection: A benchmark study on expert-annotated AlzaSet MRI dataset across anatomical planes'," Zenodo, version v2, 2025, doi: 10.5281/zenodo.17084199. [Online]. Available: https://zenodo.org/records/17084199
+
+[10] R. Müller, S. Kornblith, and G. E. Hinton, "When does label smoothing help?," in *Advances in Neural Information Processing Systems (NeurIPS)*, vol. 32, 2019. [Online]. Available: https://arxiv.org/abs/1906.02629
+
+[11] G. Xia, O. Laurent, G. Franchi, and C.-S. Bouganis, "Towards understanding why label smoothing degrades selective classification and how to fix it," in *Proc. Int. Conf. Learning Representations (ICLR)*, 2025. [Online]. Available: https://arxiv.org/abs/2403.14715

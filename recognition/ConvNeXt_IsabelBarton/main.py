@@ -11,13 +11,13 @@ import torch.backends.cudnn as cudnn
 import numpy as np
 from pathlib import Path
 
-from timm.data.mixup import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.loss import LabelSmoothingCrossEntropy
 from timm.utils import ModelEma
 
 from dataset import build_dataset
 from optim_factory import create_optimizer
 from train import train_one_epoch, evaluate
+from predict import run_test
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import modules
 import normalise
@@ -40,7 +40,7 @@ def get_args_parser():
     
     parser.add_argument('--batch_size', default=64, type=int,
                         help='Batch size')
-    parser.add_argument('--epochs', default=150, type=int)
+    parser.add_argument('--epochs', default=60, type=int) # 100-epoch run peaked on val at 55, so cosine decay now finishes around there
 
     parser.add_argument('--update_freq', default=1, type=int,
                         help='gradient accumulation steps')
@@ -58,16 +58,19 @@ def get_args_parser():
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help='Initial value of the per-channel layer scale (gamma); 0 disables it (default: 1e-6)')
 
-    # EMA related parameters
-    parser.add_argument('--model_ema', type=str2bool, default=False)
-    parser.add_argument('--model_ema_decay', type=float, default=0.9999, help='')
-    parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
+    # EMA related parameters (off by default)
+    parser.add_argument('--model_ema', type=str2bool, default=False,
+                        help='Keep an exponential moving average copy of the model weights')
+    # averages over ~1/(1 - decay) steps. paper's 0.9999 = 10,000 steps = ~32 of 300 ImageNet epochs (~11% of training)
+    # ADNI has ~285 steps/epoch, so 0.9999 would average over ~35 of 100 epochs and still hold ~6% of the random
+    # init weights at the end; 0.9997 averages over ~3,333 steps (~12 of 100 epochs), the same proportion as the paper
+    parser.add_argument('--model_ema_decay', type=float, default=0.9997,
+                        help='EMA decay: ema = decay * ema + (1 - decay) * weights (default: 0.9997)')
+    parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False,
+                        help='Store the EMA copy on the CPU to save GPU memory')
     parser.add_argument('--model_ema_eval', type=str2bool, default=False, help='Using ema to eval during training.')
 
-    # Optimization parameters
-    parser.add_argument('--opt', default='adamw', type=str,
-                        help='Optimizer (default: "adamw"')
-
+    # Optimization parameters (optimiser is always AdamW, see optim_factory.py)
     parser.add_argument('--opt_eps', default=1e-8, type=float,
                         help='Optimizer Epsilon (default: 1e-8)')
 
@@ -77,9 +80,6 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=None,
                         help='Clip gradient norm (default: None, no clipping)')
     
-    parser.add_argument('--momentum', type=float, default=0.9,
-                        help='SGD momentum (default: 0.9)')
-    
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
     
@@ -87,13 +87,14 @@ def get_args_parser():
         weight decay. We use a cosine schedule for WD and using a larger decay by
         the end of training improves performance for ViTs.""")
 
-    parser.add_argument('--lr', type=float, default=4e-3,
-                        help='learning rate (default: 4e-3)')
+    # paper's 4e-3 is for batch 4096; square-root scaled to batch 64: 4e-3 * sqrt(64/4096) = 5e-4 (not yet tuned on ADNI)
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='learning rate (default: 5e-4)')
 
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='lower lr bound for cyclic schedulers that hit 0 (1e-6)')
     
-    parser.add_argument('--warmup_epochs', type=int, default=20,
+    parser.add_argument('--warmup_epochs', type=int, default=5, # ~8% of 60 epochs, close to the paper's 20 of 300
                         help='epochs to warmup LR, if scheduler supports')
 
     parser.add_argument('--warmup_steps', type=int, default=-1,
@@ -120,25 +121,6 @@ def get_args_parser():
     parser.add_argument('--recount', type=int, default=1,
                         help='Random erase count (default: 1)')
 
-    # * Mixup params
-    parser.add_argument('--mixup', type=float, default=0.8,
-                        help='mixup alpha, mixup enabled if > 0.')
-
-    parser.add_argument('--cutmix', type=float, default=1.0,
-                        help='cutmix alpha, cutmix enabled if > 0.')
-
-    parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None,
-                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
-
-    parser.add_argument('--mixup_prob', type=float, default=1.0,
-                        help='Probability of performing mixup or cutmix when either/both is enabled')
-
-    parser.add_argument('--mixup_switch_prob', type=float, default=0.5,
-                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
-
-    parser.add_argument('--mixup_mode', type=str, default='batch',
-                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
-
     # Dataset parameters
     parser.add_argument('--data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/train', type=str,
                         help='dataset path')
@@ -163,8 +145,6 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--use_amp', type=str2bool, default=True,
-                        help='Use PyTorch automatic mixed precision (much faster on an RTX GPU)')
 
     # Checkpointing / resuming
     parser.add_argument('--save_ckpt', type=str2bool, default=True)
@@ -197,29 +177,7 @@ def build_model(args):
     )
 
 
-def run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name, extra=None):
-    """Evaluate on the held-out test split and save metrics + per-slice predictions to output_dir."""
-    print(f"Evaluating {checkpoint_name} on the test set ({len(dataset_test)} images)")
-    test_stats, probs, targets = evaluate(data_loader_test, model, device, use_amp=args.use_amp,
-                                          header='Test:', return_preds=True)
-    print(f"Accuracy of the network on the {len(dataset_test)} test images: {test_stats['acc1']:.2f}%")
 
-    if args.output_dir:
-        results = {'checkpoint': checkpoint_name, 'num_test_images': len(dataset_test),
-                   **{f'test_{k}': v for k, v in test_stats.items()}, **(extra or {})}
-        with open(os.path.join(args.output_dir, 'test_results.json'), 'w') as f:
-            json.dump(results, f, indent=2)
-
-        # per-slice softmax outputs, for calibration / reliability analysis later
-        idx_to_class = {v: k for k, v in dataset_test.class_to_idx.items()}
-        with open(os.path.join(args.output_dir, 'test_predictions.csv'), 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(['path', 'label', 'pred'] + [f'prob_{idx_to_class[i]}' for i in range(probs.shape[1])])
-            for (path, _), target, p in zip(dataset_test.samples, targets.tolist(), probs.tolist()):
-                pred = max(range(len(p)), key=p.__getitem__)
-                writer.writerow([path, idx_to_class[target], idx_to_class[pred]] + [f'{x:.6f}' for x in p])
-        print(f"Saved test_results.json and test_predictions.csv to {args.output_dir}")
-    return test_stats
 
 
 def main(args):
@@ -228,6 +186,10 @@ def main(args):
 
     #device to run on
     device = torch.device(args.device)
+    # training always uses AMP (autocast/GradScaler on 'cuda'), so it needs a CUDA GPU
+    if device.type != 'cuda' or not torch.cuda.is_available():
+        raise SystemExit("main.py needs a CUDA GPU (training always uses mixed precision); "
+                         "use predict.py to evaluate a trained model on a CPU")
 
     # fix the seed for reproducibility
     torch.manual_seed(args.seed)
@@ -276,94 +238,112 @@ def main(args):
         drop_last=False
     )
 
-    # removed for ADNI as the entire image is bnot relevant to AD or NC classification only certain section so mixing classes has opposite of desired effect
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-            label_smoothing=args.smoothing, num_classes=args.nb_classes)
+    # mixup/cutmix from the paper removed for ADNI: they blend or paste two brains together, so the label no longer
+    # matches the anatomy that defines AD vs NC (see README "Why mixup and CutMix are not used")
 
     #build the CONVNEXT
     model = build_model(args)
     model.to(device)
 
+    # EMA: a second copy of the model whose weights slowly follow the trained weights,
+    # updated after every optimizer step in train.py; smooths out step-to-step noise
     model_ema = None
     if args.model_ema:
         # create the EMA copy after the model has been moved to the device
         model_ema = ModelEma(
             model,
-            decay=args.model_ema_decay,
-            device='cpu' if args.model_ema_force_cpu else '',
-            resume='')
+            decay=args.model_ema_decay, # ema = decay * ema + (1 - decay) * current weights
+            device='cpu' if args.model_ema_force_cpu else '', # '' = same device as the model
+            resume='') # don't load from a file; resumed runs restore EMA from the checkpoint instead
         print("Using EMA with decay = %.8f" % args.model_ema_decay)
 
+    #No. OF TRAINABLE PARAMATERS IN THE ENTIRE MODEL
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+    # RUn details
     print("Model = %s" % str(model))
     print('number of params:', n_parameters)
 
+    # effective batch size: gradients from update_freq batches are summed before one optimizer step, e.g. 32 x 2 = 64
     total_batch_size = args.batch_size * args.update_freq
+    # optimizer steps per epoch (rounded down), e.g. 18,300 // 64 = 285; the LR/WD schedules are built per step from this
     num_training_steps_per_epoch = len(dataset_train) // total_batch_size
+    
     print("LR = %.8f" % args.lr)
     print("Batch size = %d" % total_batch_size)
     print("Update frequent = %d" % args.update_freq)
     print("Number of training examples = %d" % len(dataset_train))
     print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
 
-    optimizer = create_optimizer(args, model, skip_list=None)
+    #choose optimiser
+    optimizer = create_optimizer(args, model)
 
-    loss_scaler = NativeScaler() # if args.use_amp is False, this won't be used
+    # AMP loss scaler: float16 rounds tiny gradients to 0, so the loss is multiplied by a large factor before backward(),
+    # gradients are divided back before the optimiser step, and steps with inf/NaN gradients are skipped (factor then halved)
+    loss_scaler = NativeScaler()
 
+    # one lr per optimizer step for the whole run 
+    # linear warmup 0 -> lr (random init gives large, unreliable early gradients), then cosine decay lr -> min_lr
+    # (big exploring steps early, small settling steps at the end)
     print("Use Cosine LR scheduler")
     lr_schedule_values = utils.cosine_scheduler(
         args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
     )
 
+    # weight decay schedule built the same way (no warmup); weight_decay_end None = constant at weight_decay (0.05)
+    # each step AdamW shrinks decayed weights: w <- w - lr * wd * w, so the real shrinking still follows the lr schedule
     if args.weight_decay_end is None:
-        args.weight_decay_end = args.weight_decay
+        args.weight_decay_end = args.weight_decay # start = end, so the cosine curve is a flat line
+    # train.py only applies this to groups with wd > 0, so biases/norms/gamma (no_decay group) stay at 0
     wd_schedule_values = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values))) # 0.05 / 0.05 when constant
 
-    if mixup_fn is not None:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing > 0.:
+
+    # cross-entropy with label smoothing: target [1, 0] becomes [0.95, 0.05] (0.9 x one-hot + 0.1 x uniform),
+    # so the model is penalised for being over-confident; plain cross-entropy if --smoothing 0
+    if args.smoothing > 0.:
         criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
         criterion = torch.nn.CrossEntropyLoss()
 
     print("criterion = %s" % str(criterion))
 
+    # resume an interrupted run: loads the latest checkpoint-<epoch>.pth in output_dir (or --resume <path>) and restores
+    # weights, AdamW state, EMA, AMP scale and start_epoch, so training and the lr schedule continue where they stopped.
+    # use a new output_dir per run
     utils.auto_load_model(
         args=args, model=model,
         optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
 
+    # the script skips training completely, tests the model on the test set once, saves the results, and exits
+    # --eval True: skip training, test the loaded checkpoint once on the test set, save test_results.json +
+    # test_predictions.csv (per-slice probabilities, for calibration) to output_dir, then exit.
+    # pass --resume .../checkpoint-best.pth: otherwise auto_resume loads the LATEST epoch, not the best one.
+    # use a new output_dir to avoid overwriting the training run's test results
     if args.eval:
         print(f"Eval only mode")
-        run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name=args.resume or 'initial weights')
+        run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name=args.resume or 'initial weights') # 'initial weights' = nothing loaded (random, ~50%)
         return
 
-    max_accuracy = 0.0
+    max_accuracy = 0.0 #accuracy counter
     if args.model_ema and args.model_ema_eval:
-        max_accuracy_ema = 0.0
+        max_accuracy_ema = 0.0 #ema accuracy counter
 
     print("Start training for %d epochs" % args.epochs)
+    #start epock timer
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
+        
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer,
-            device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
+            device, epoch, loss_scaler, args.clip_grad, model_ema,
             log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-            use_amp=args.use_amp
         )
         if args.output_dir and args.save_ckpt:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
@@ -371,7 +351,7 @@ def main(args):
                     args=args, model=model, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
         if data_loader_val is not None:
-            val_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp, header='Val:')
+            val_stats = evaluate(data_loader_val, model, device, use_amp=True, header='Val:')
             print(f"Accuracy of the model on the {len(dataset_val)} validation images: {val_stats['acc1']:.1f}%")
             if max_accuracy < val_stats["acc1"]:
                 max_accuracy = val_stats["acc1"]
@@ -395,7 +375,7 @@ def main(args):
 
             # repeat testing routines for EMA, if ema eval is turned on
             if args.model_ema and args.model_ema_eval:
-                val_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp, header='Val (EMA):')
+                val_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=True, header='Val (EMA):')
                 print(f"Accuracy of the model EMA on {len(dataset_val)} validation images: {val_stats_ema['acc1']:.1f}%")
                 if max_accuracy_ema < val_stats_ema["acc1"]:
                     max_accuracy_ema = val_stats_ema["acc1"]
