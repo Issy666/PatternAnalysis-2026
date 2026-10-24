@@ -16,7 +16,7 @@ from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import ModelEma
 
 from dataset import build_dataset
-from optim_factory import create_optimizer, LayerDecayValueAssigner
+from optim_factory import create_optimizer
 from train import train_one_epoch, evaluate
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import modules
@@ -49,14 +49,14 @@ def get_args_parser():
     parser.add_argument('--model', default='convnext_tiny', type=str,
                         help='Name of model to train (a model function in modules.py)')
 
-    parser.add_argument('--drop_path', type=float, default=0,
-                        help='Drop path rate (default: 0.0)')
+    parser.add_argument('--drop_path', type=float, default=0.1,
+                        help='Drop path (stochastic depth) rate (default: 0.1)')
                         
     parser.add_argument('--input_size', default=256, type=int,
                         help='image input size')
 
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
-                        help="Layer scale initial values")
+                        help='Initial value of the per-channel layer scale (gamma); 0 disables it (default: 1e-6)')
 
     # EMA related parameters
     parser.add_argument('--model_ema', type=str2bool, default=False)
@@ -89,8 +89,6 @@ def get_args_parser():
 
     parser.add_argument('--lr', type=float, default=4e-3,
                         help='learning rate (default: 4e-3)')
-
-    parser.add_argument('--layer_decay', type=float, default=1.0)
 
     parser.add_argument('--min_lr', type=float, default=1e-6,
                         help='lower lr bound for cyclic schedulers that hit 0 (1e-6)')
@@ -141,18 +139,6 @@ def get_args_parser():
     parser.add_argument('--mixup_mode', type=str, default='batch',
                         help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
 
-    # * Finetuning params
-    parser.add_argument('--finetune', default='',
-                        help='finetune from checkpoint')
-
-    parser.add_argument('--head_init_scale', default=1.0, type=float,
-                        help='classifier head initial scale, typically adjusted in fine-tuning')
-
-    parser.add_argument('--model_key', default='model|module', type=str,
-                        help='which key to load from saved state dict, usually model or model_ema')
-
-    parser.add_argument('--model_prefix', default='', type=str)
-
     # Dataset parameters
     parser.add_argument('--data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/train', type=str,
                         help='dataset path')
@@ -201,15 +187,13 @@ def get_args_parser():
     return parser
 
 def build_model(args):
-    # models are built straight from modules.py
+    # models are built straight from modules.py and trained from scratch (random initial weights)
     if not hasattr(modules, args.model):
         raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: convnext_tiny")
     return getattr(modules, args.model)(
-        pretrained=False,
         num_classes=args.nb_classes,
-        drop_path_rate=args.drop_path,
-        layer_scale_init_value=args.layer_scale_init_value,
-        head_init_scale=args.head_init_scale,
+        drop_path_rate=args.drop_path, # reduce overfitting by dropping blocks in the model
+        layer_scale_init_value=args.layer_scale_init_value, #add a scalar to each block per channel to deterine the influence of each blocks
     )
 
 
@@ -256,6 +240,7 @@ def main(args):
     dataset_val, _ = build_dataset(split='val', args=args)
     dataset_test, _ = build_dataset(split='test', args=args)
 
+    # LOG DIRECTORY
     if args.log_dir:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
@@ -291,6 +276,7 @@ def main(args):
         drop_last=False
     )
 
+    # removed for ADNI as the entire image is bnot relevant to AD or NC classification only certain section so mixing classes has opposite of desired effect
     mixup_fn = None
     mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
     if mixup_active:
@@ -300,30 +286,8 @@ def main(args):
             prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
             label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
+    #build the CONVNEXT
     model = build_model(args)
-
-    if args.finetune:
-        if args.finetune.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.finetune, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
-
-        print("Load ckpt from %s" % args.finetune)
-        checkpoint_model = None
-        for model_key in args.model_key.split('|'):
-            if model_key in checkpoint:
-                checkpoint_model = checkpoint[model_key]
-                print("Load state_dict by model_key = %s" % model_key)
-                break
-        if checkpoint_model is None:
-            checkpoint_model = checkpoint
-        state_dict = model.state_dict()
-        for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-                print(f"Removing key {k} from pretrained checkpoint")
-                del checkpoint_model[k]
-        utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
     model.to(device)
 
     model_ema = None
@@ -349,21 +313,7 @@ def main(args):
     print("Number of training examples = %d" % len(dataset_train))
     print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
 
-    if args.layer_decay < 1.0 or args.layer_decay > 1.0:
-        num_layers = 12 # convnext layers divided into 12 parts, each with a different decayed lr value.
-        assert args.model in ['convnext_small', 'convnext_base', 'convnext_large', 'convnext_xlarge'], \
-             "Layer Decay impl only supports convnext_small/base/large/xlarge"
-        assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
-    else:
-        assigner = None
-
-    if assigner is not None:
-        print("Assigned values = %s" % str(assigner.values))
-
-    optimizer = create_optimizer(
-        args, model, skip_list=None,
-        get_num_layer=assigner.get_layer_id if assigner is not None else None,
-        get_layer_scale=assigner.get_scale if assigner is not None else None)
+    optimizer = create_optimizer(args, model, skip_list=None)
 
     loss_scaler = NativeScaler() # if args.use_amp is False, this won't be used
 

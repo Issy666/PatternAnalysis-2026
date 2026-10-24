@@ -61,11 +61,10 @@ class ConvNeXt(nn.Module):
         dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
         drop_path_rate (float): Stochastic depth rate. Default: 0.
         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
     """
-    def __init__(self, in_chans=3, num_classes=1000, 
-                 depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0., 
-                 layer_scale_init_value=1e-6, head_init_scale=1.,
+    def __init__(self, in_chans=3, num_classes=1000,
+                 depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.,
+                 layer_scale_init_value=1e-6,
                  ):
         super().__init__()
 
@@ -97,8 +96,6 @@ class ConvNeXt(nn.Module):
         self.head = nn.Linear(dims[-1], num_classes)
 
         self.apply(self._init_weights)
-        self.head.weight.data.mul_(head_init_scale)
-        self.head.bias.data.mul_(head_init_scale)
 
     def _init_weights(self, m):
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -143,24 +140,8 @@ class LayerNorm(nn.Module):
             return x
 
 
-model_urls = {
-    "convnext_tiny_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_1k_224_ema.pth",
-    "convnext_small_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_1k_224_ema.pth",
-    "convnext_base_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_base_1k_224_ema.pth",
-    "convnext_large_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_large_1k_224_ema.pth",
-    "convnext_tiny_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_22k_224.pth",
-    "convnext_small_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_22k_224.pth",
-    "convnext_base_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_224.pth",
-    "convnext_large_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_224.pth",
-    "convnext_xlarge_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_224.pth",
-}
-
 # not registered with timm: timm already has its own convnext_tiny, and main.py builds models from this file directly
-def convnext_tiny(pretrained=False,in_22k=False, **kwargs):
+def convnext_tiny(**kwargs):
     model = ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs)
-    if pretrained:
-        url = model_urls['convnext_tiny_22k'] if in_22k else model_urls['convnext_tiny_1k']
-        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu", check_hash=True)
-        model.load_state_dict(checkpoint["model"])
     return model
 

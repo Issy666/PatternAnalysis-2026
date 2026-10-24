@@ -39,10 +39,25 @@
 |---|---|---|
 | `--model` | `convnext_tiny` | Name of the model architecture to train (a model function in `modules.py`). |
 | `--input_size` | `256` | Height and width (pixels) images are resized to before entering the network. |
-| `--drop_path` | `0` | Stochastic depth rate (randomly drops residual blocks during training for regularisation). |
-| `--layer_scale_init_value` | `1e-6` | Initial value of ConvNeXt's per-channel layer scale parameters. |
+| `--drop_path` | `0.1` | Stochastic depth rate (randomly drops residual blocks during training for regularisation). See below. |
+| `--layer_scale_init_value` | `1e-6` | Initial value of ConvNeXt's per-channel layer scale parameters. See below. |
 | `--nb_classes` | `2` | Number of output classes (AD and NC). |
-| `--head_init_scale` | `1.0` | Scale applied to the classifier head's initial weights; typically adjusted when fine-tuning. |
+
+#### Drop path (stochastic depth)
+
+Each ConvNeXt block has two paths: a **residual branch** (the block's convolutions and layers, which learn features) and a **shortcut** that carries the input forward unchanged. Their outputs are added, `output = input + branch(input)`, so each block learns a correction on top of its input.
+
+During training, drop path randomly discards the residual branch for individual images, so `output = input` and that block is skipped for that image. The skip probability rises linearly with depth, from 0 for the first block to `--drop_path` for the last. Early blocks learn basic features such as edges and are rarely skipped. Deep blocks are skipped most often. At test time every block always runs.
+
+Because the network can't rely on any single deep block, it overfits less. This matters for ADNI: the training slices come from only about a thousand patients (20 slices each), and neighbouring slices are very similar. `0.1` is the value the ConvNeXt paper uses for ConvNeXt-T [1]. Try `0.2`–`0.3` if validation accuracy falls well behind training accuracy.
+
+#### Layer scale
+
+Layer scale multiplies each block's residual branch by a learnable vector `gamma`, with one value per channel: `output = input + gamma * branch(input)`. Every value in `gamma` starts at `--layer_scale_init_value` and is learned during training like any other weight.
+
+Starting at `1e-6` means each branch adds almost nothing at first, so the 18-block network begins close to an identity mapping (`output ≈ input`). Each block then "switches on" gradually as its `gamma` grows. This keeps early training stable: without it, the randomly initialised branches of all 18 blocks add noise together from the first step, which can cause large, unstable gradients at a high learning rate such as `4e-3`. The per-channel values also let the network learn how much each feature in each block should contribute.
+
+`1e-6` is the value from the ConvNeXt paper [1].
 
 ### Exponential Moving Average (EMA)
 
@@ -68,7 +83,6 @@
 | `--warmup_steps` | `-1` | Number of warm-up steps; overrides `--warmup_epochs` if greater than 0. |
 | `--weight_decay` | `0.05` | Weight decay (L2 regularisation strength). |
 | `--weight_decay_end` | `None` | Final weight decay for the cosine weight decay schedule; `None` keeps it constant. |
-| `--layer_decay` | `1.0` | Layer-wise learning rate decay; `1.0` gives every layer the same learning rate. |
 
 ### Augmentation and Regularisation
 
@@ -115,9 +129,6 @@
 | `--save_ckpt_num` | `3` | Number of recent epoch checkpoints to keep. |
 | `--resume` | `''` | Checkpoint to resume training from, or to evaluate with `--eval True`. |
 | `--auto_resume` | `True` | Resume from the latest checkpoint in `--output_dir` if one exists. |
-| `--finetune` | `''` | Path or URL of a checkpoint to fine-tune from. |
-| `--model_key` | `model\|module` | Key(s) to look for in the checkpoint's state dict. |
-| `--model_prefix` | `''` | Prefix to strip from checkpoint parameter names when loading. |
 | `--eval` | `False` | Only evaluate a trained model on the test set (no training). |
 | `--disable_eval` | `False` | Skip validation during training. |
 
