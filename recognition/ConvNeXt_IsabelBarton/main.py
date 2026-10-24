@@ -1,12 +1,27 @@
 
 import argparse
+import csv
+import datetime
+import json
+import os
+import time
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import numpy as np
 from pathlib import Path
+
+from timm.data.mixup import Mixup
+from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+from timm.utils import ModelEma
+
 from dataset import build_dataset
+from optim_factory import create_optimizer, LayerDecayValueAssigner
+from train import train_one_epoch, evaluate
+from utils import NativeScalerWithGradNormCount as NativeScaler
+import modules
 import normalise
+import utils
 
 
 def str2bool(v):
@@ -24,15 +39,15 @@ def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training + evaluation script for MRI AD or CN classification', add_help=False)
     
     parser.add_argument('--batch_size', default=64, type=int,
-                        help='Per GPU batch size')
+                        help='Batch size')
     parser.add_argument('--epochs', default=150, type=int)
 
     parser.add_argument('--update_freq', default=1, type=int,
                         help='gradient accumulation steps')
 
     # Model parameters
-    parser.add_argument('--model', default='convnext', type=str,
-                        help='Name of model to train')
+    parser.add_argument('--model', default='convnext_tiny', type=str,
+                        help='Name of model to train (a model function in modules.py)')
 
     parser.add_argument('--drop_path', type=float, default=0,
                         help='Drop path rate (default: 0.0)')
@@ -88,9 +103,9 @@ def get_args_parser():
 
     # Augmentation parameters
     parser.add_argument('--aa', type=str, default='',
-                        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)')
+                        help='Use AutoAugment policy, e.g. "rand-m9-mstd0.5-inc1". (default: "" = off)')
     parser.add_argument('--color_jitter', type=float, default=0, metavar='PCT',
-                        help='Color jitter factor (default: 0.4)')
+                        help='Color jitter factor (default: 0 = off)')
     parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
     parser.add_argument('--train_interpolation', type=str, default='bilinear',
@@ -162,299 +177,316 @@ def get_args_parser():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--use_amp', type=str2bool, default=True,
+                        help='Use PyTorch automatic mixed precision (much faster on an RTX GPU)')
 
+    # Checkpointing / resuming
+    parser.add_argument('--save_ckpt', type=str2bool, default=True)
+    parser.add_argument('--save_ckpt_freq', default=1, type=int,
+                        help='save a checkpoint every N epochs')
+    parser.add_argument('--save_ckpt_num', default=3, type=int,
+                        help='number of recent epoch checkpoints to keep (checkpoint-best.pth is always kept)')
+    parser.add_argument('--resume', default='',
+                        help='resume from checkpoint')
+    parser.add_argument('--auto_resume', type=str2bool, default=True,
+                        help='resume from the latest checkpoint in output_dir if one exists')
 
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
                         help='start epoch')
     parser.add_argument('--eval', type=str2bool, default=False,
                         help='Perform evaluation only')
-    parser.add_argument('--dist_eval', type=str2bool, default=True,
-                        help='Enabling distributed evaluation')
     parser.add_argument('--disable_eval', type=str2bool, default=False,
                         help='Disabling evaluation during training')
 
-    # Weights and Biases arguments
-    parser.add_argument('--enable_wandb', type=str2bool, default=False,
-                        help="enable logging to Weights and Biases")
-    parser.add_argument('--project', default='convnext', type=str,
-                        help="The name of the W&B project where you're sending the new run.")
-    parser.add_argument('--wandb_ckpt', type=str2bool, default=False,
-                        help="Save model checkpoints as W&B Artifacts.")
-
     return parser
 
+def build_model(args):
+    # models are built straight from modules.py
+    if not hasattr(modules, args.model):
+        raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: convnext_tiny")
+    return getattr(modules, args.model)(
+        pretrained=False,
+        num_classes=args.nb_classes,
+        drop_path_rate=args.drop_path,
+        layer_scale_init_value=args.layer_scale_init_value,
+        head_init_scale=args.head_init_scale,
+    )
+
+
+def run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name, extra=None):
+    """Evaluate on the held-out test split and save metrics + per-slice predictions to output_dir."""
+    print(f"Evaluating {checkpoint_name} on the test set ({len(dataset_test)} images)")
+    test_stats, probs, targets = evaluate(data_loader_test, model, device, use_amp=args.use_amp,
+                                          header='Test:', return_preds=True)
+    print(f"Accuracy of the network on the {len(dataset_test)} test images: {test_stats['acc1']:.2f}%")
+
+    if args.output_dir:
+        results = {'checkpoint': checkpoint_name, 'num_test_images': len(dataset_test),
+                   **{f'test_{k}': v for k, v in test_stats.items()}, **(extra or {})}
+        with open(os.path.join(args.output_dir, 'test_results.json'), 'w') as f:
+            json.dump(results, f, indent=2)
+
+        # per-slice softmax outputs, for calibration / reliability analysis later
+        idx_to_class = {v: k for k, v in dataset_test.class_to_idx.items()}
+        with open(os.path.join(args.output_dir, 'test_predictions.csv'), 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['path', 'label', 'pred'] + [f'prob_{idx_to_class[i]}' for i in range(probs.shape[1])])
+            for (path, _), target, p in zip(dataset_test.samples, targets.tolist(), probs.tolist()):
+                pred = max(range(len(p)), key=p.__getitem__)
+                writer.writerow([path, idx_to_class[target], idx_to_class[pred]] + [f'{x:.6f}' for x in p])
+        print(f"Saved test_results.json and test_predictions.csv to {args.output_dir}")
+    return test_stats
+
+
 def main(args):
+
     print(args)
+
     #device to run on
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     #enables the NVIDIA cuDNN auto-tuner to test multiple convolution algorithms and select the fastest one for your GPU  Works for inputs that are the same size
     cudnn.benchmark = True
 
     dataset_train, args.nb_classes = build_dataset(split='train', args=args)
-    if args.disable_eval:
-        args.dist_eval = False
-        dataset_val = None
-    else:
-        dataset_val, _ = build_dataset(split='val', args=args)
+    dataset_val, _ = build_dataset(split='val', args=args)
     dataset_test, _ = build_dataset(split='test', args=args)
 
-    # num_tasks = utils.get_world_size()
-    # global_rank = utils.get_rank()
+    if args.log_dir:
+        os.makedirs(args.log_dir, exist_ok=True)
+        log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
+    else:
+        log_writer = None
 
-    # sampler_train = torch.utils.data.DistributedSampler(
-    #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=args.seed,
-    # )
-    # print("Sampler_train = %s" % str(sampler_train))
-    # if args.dist_eval:
-    #     if len(dataset_val) % num_tasks != 0:
-    #         print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-    #                 'This will slightly alter validation results as extra duplicate entries are added to achieve '
-    #                 'equal num of samples per-process.')
-    #     sampler_val = torch.utils.data.DistributedSampler(
-    #         dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-    # else:
-    #     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    # shuffle=True reshuffles the training data every epoch
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, shuffle=True,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+    )
 
-    # if global_rank == 0 and args.log_dir is not None:
-    #     os.makedirs(args.log_dir, exist_ok=True)
-    #     log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    # else:
-    #     log_writer = None
+    if dataset_val is not None:
+        data_loader_val = torch.utils.data.DataLoader(
+            dataset_val, shuffle=False,
+            batch_size=int(1.5 * args.batch_size),
+            num_workers=args.num_workers,
+            pin_memory=args.pin_mem,
+            drop_last=False
+        )
+    else:
+        data_loader_val = None
 
-    # if global_rank == 0 and args.enable_wandb:
-    #     wandb_logger = utils.WandbLogger(args)
-    # else:
-    #     wandb_logger = None
+    # test is evaluated in order, so predictions line up with dataset_test.samples
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, shuffle=False,
+        batch_size=int(1.5 * args.batch_size),
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=False
+    )
 
-    # data_loader_train = torch.utils.data.DataLoader(
-    #     dataset_train, sampler=sampler_train,
-    #     batch_size=args.batch_size,
-    #     num_workers=args.num_workers,
-    #     pin_memory=args.pin_mem,
-    #     drop_last=True,
-    # )
+    mixup_fn = None
+    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
+    if mixup_active:
+        print("Mixup is activated!")
+        mixup_fn = Mixup(
+            mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
+            prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
+            label_smoothing=args.smoothing, num_classes=args.nb_classes)
 
-    # if dataset_val is not None:
-    #     data_loader_val = torch.utils.data.DataLoader(
-    #         dataset_val, sampler=sampler_val,
-    #         batch_size=int(1.5 * args.batch_size),
-    #         num_workers=args.num_workers,
-    #         pin_memory=args.pin_mem,
-    #         drop_last=False
-    #     )
-    # else:
-    #     data_loader_val = None
+    model = build_model(args)
 
-    # mixup_fn = None
-    # mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    # if mixup_active:
-    #     print("Mixup is activated!")
-    #     mixup_fn = Mixup(
-    #         mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-    #         prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-    #         label_smoothing=args.smoothing, num_classes=args.nb_classes)
+    if args.finetune:
+        if args.finetune.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.finetune, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.finetune, map_location='cpu', weights_only=False)
 
-    # model = create_model(
-    #     args.model, 
-    #     pretrained=False, 
-    #     num_classes=args.nb_classes, 
-    #     drop_path_rate=args.drop_path,
-    #     layer_scale_init_value=args.layer_scale_init_value,
-    #     head_init_scale=args.head_init_scale,
-    #     )
+        print("Load ckpt from %s" % args.finetune)
+        checkpoint_model = None
+        for model_key in args.model_key.split('|'):
+            if model_key in checkpoint:
+                checkpoint_model = checkpoint[model_key]
+                print("Load state_dict by model_key = %s" % model_key)
+                break
+        if checkpoint_model is None:
+            checkpoint_model = checkpoint
+        state_dict = model.state_dict()
+        for k in ['head.weight', 'head.bias']:
+            if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
+                print(f"Removing key {k} from pretrained checkpoint")
+                del checkpoint_model[k]
+        utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
+    model.to(device)
 
-    # if args.finetune:
-    #     if args.finetune.startswith('https'):
-    #         checkpoint = torch.hub.load_state_dict_from_url(
-    #             args.finetune, map_location='cpu', check_hash=True)
-    #     else:
-    #         checkpoint = torch.load(args.finetune, map_location='cpu')
+    model_ema = None
+    if args.model_ema:
+        # create the EMA copy after the model has been moved to the device
+        model_ema = ModelEma(
+            model,
+            decay=args.model_ema_decay,
+            device='cpu' if args.model_ema_force_cpu else '',
+            resume='')
+        print("Using EMA with decay = %.8f" % args.model_ema_decay)
 
-    #     print("Load ckpt from %s" % args.finetune)
-    #     checkpoint_model = None
-    #     for model_key in args.model_key.split('|'):
-    #         if model_key in checkpoint:
-    #             checkpoint_model = checkpoint[model_key]
-    #             print("Load state_dict by model_key = %s" % model_key)
-    #             break
-    #     if checkpoint_model is None:
-    #         checkpoint_model = checkpoint
-    #     state_dict = model.state_dict()
-    #     for k in ['head.weight', 'head.bias']:
-    #         if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-    #             print(f"Removing key {k} from pretrained checkpoint")
-    #             del checkpoint_model[k]
-    #     utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
-    # model.to(device)
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # model_ema = None
-    # if args.model_ema:
-    #     # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
-    #     model_ema = ModelEma(
-    #         model,
-    #         decay=args.model_ema_decay,
-    #         device='cpu' if args.model_ema_force_cpu else '',
-    #         resume='')
-    #     print("Using EMA with decay = %.8f" % args.model_ema_decay)
+    print("Model = %s" % str(model))
+    print('number of params:', n_parameters)
 
-    # model_without_ddp = model
-    # n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_batch_size = args.batch_size * args.update_freq
+    num_training_steps_per_epoch = len(dataset_train) // total_batch_size
+    print("LR = %.8f" % args.lr)
+    print("Batch size = %d" % total_batch_size)
+    print("Update frequent = %d" % args.update_freq)
+    print("Number of training examples = %d" % len(dataset_train))
+    print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
 
-    # print("Model = %s" % str(model_without_ddp))
-    # print('number of params:', n_parameters)
+    if args.layer_decay < 1.0 or args.layer_decay > 1.0:
+        num_layers = 12 # convnext layers divided into 12 parts, each with a different decayed lr value.
+        assert args.model in ['convnext_small', 'convnext_base', 'convnext_large', 'convnext_xlarge'], \
+             "Layer Decay impl only supports convnext_small/base/large/xlarge"
+        assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
+    else:
+        assigner = None
 
-    # total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    # num_training_steps_per_epoch = len(dataset_train) // total_batch_size
-    # print("LR = %.8f" % args.lr)
-    # print("Batch size = %d" % total_batch_size)
-    # print("Update frequent = %d" % args.update_freq)
-    # print("Number of training examples = %d" % len(dataset_train))
-    # print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
+    if assigner is not None:
+        print("Assigned values = %s" % str(assigner.values))
 
-    # if args.layer_decay < 1.0 or args.layer_decay > 1.0:
-    #     num_layers = 12 # convnext layers divided into 12 parts, each with a different decayed lr value.
-    #     assert args.model in ['convnext_small', 'convnext_base', 'convnext_large', 'convnext_xlarge'], \
-    #          "Layer Decay impl only supports convnext_small/base/large/xlarge"
-    #     assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
-    # else:
-    #     assigner = None
+    optimizer = create_optimizer(
+        args, model, skip_list=None,
+        get_num_layer=assigner.get_layer_id if assigner is not None else None,
+        get_layer_scale=assigner.get_scale if assigner is not None else None)
 
-    # if assigner is not None:
-    #     print("Assigned values = %s" % str(assigner.values))
+    loss_scaler = NativeScaler() # if args.use_amp is False, this won't be used
 
-    # if args.distributed:
-    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
-    #     model_without_ddp = model.module
+    print("Use Cosine LR scheduler")
+    lr_schedule_values = utils.cosine_scheduler(
+        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
+        warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
+    )
 
-    # optimizer = create_optimizer(
-    #     args, model_without_ddp, skip_list=None,
-    #     get_num_layer=assigner.get_layer_id if assigner is not None else None, 
-    #     get_layer_scale=assigner.get_scale if assigner is not None else None)
+    if args.weight_decay_end is None:
+        args.weight_decay_end = args.weight_decay
+    wd_schedule_values = utils.cosine_scheduler(
+        args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
+    print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
 
-    # loss_scaler = NativeScaler() # if args.use_amp is False, this won't be used
+    if mixup_fn is not None:
+        # smoothing is handled with mixup label transform
+        criterion = SoftTargetCrossEntropy()
+    elif args.smoothing > 0.:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
+    else:
+        criterion = torch.nn.CrossEntropyLoss()
 
-    # print("Use Cosine LR scheduler")
-    # lr_schedule_values = utils.cosine_scheduler(
-    #     args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-    #     warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-    # )
+    print("criterion = %s" % str(criterion))
 
-    # if args.weight_decay_end is None:
-    #     args.weight_decay_end = args.weight_decay
-    # wd_schedule_values = utils.cosine_scheduler(
-    #     args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    # print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
+    utils.auto_load_model(
+        args=args, model=model,
+        optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
 
-    # if mixup_fn is not None:
-    #     # smoothing is handled with mixup label transform
-    #     criterion = SoftTargetCrossEntropy()
-    # elif args.smoothing > 0.:
-    #     criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    # else:
-    #     criterion = torch.nn.CrossEntropyLoss()
+    if args.eval:
+        print(f"Eval only mode")
+        run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name=args.resume or 'initial weights')
+        return
 
-    # print("criterion = %s" % str(criterion))
+    max_accuracy = 0.0
+    if args.model_ema and args.model_ema_eval:
+        max_accuracy_ema = 0.0
 
-    # utils.auto_load_model(
-    #     args=args, model=model, model_without_ddp=model_without_ddp,
-    #     optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
+    print("Start training for %d epochs" % args.epochs)
+    start_time = time.time()
+    for epoch in range(args.start_epoch, args.epochs):
+        if log_writer is not None:
+            log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train, optimizer,
+            device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
+            log_writer=log_writer, start_steps=epoch * num_training_steps_per_epoch,
+            lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
+            num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
+            use_amp=args.use_amp
+        )
+        if args.output_dir and args.save_ckpt:
+            if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
+                utils.save_model(
+                    args=args, model=model, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
+        if data_loader_val is not None:
+            val_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp, header='Val:')
+            print(f"Accuracy of the model on the {len(dataset_val)} validation images: {val_stats['acc1']:.1f}%")
+            if max_accuracy < val_stats["acc1"]:
+                max_accuracy = val_stats["acc1"]
+                if args.output_dir and args.save_ckpt:
+                    utils.save_model(
+                        args=args, model=model, optimizer=optimizer,
+                        loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
+            print(f'Max validation accuracy: {max_accuracy:.2f}%')
 
-    # if args.eval:
-    #     print(f"Eval only mode")
-    #     test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-    #     print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
-    #     return
+            if log_writer is not None:
+                log_writer.update(val_acc1=val_stats['acc1'], head="perf", step=epoch)
+                log_writer.update(val_loss=val_stats['loss'], head="perf", step=epoch)
+                if 'ad_recall' in val_stats:
+                    log_writer.update(val_ad_recall=val_stats['ad_recall'], head="perf", step=epoch)
+                    log_writer.update(val_nc_recall=val_stats['nc_recall'], head="perf", step=epoch)
 
-    # max_accuracy = 0.0
-    # if args.model_ema and args.model_ema_eval:
-    #     max_accuracy_ema = 0.0
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         **{f'val_{k}': v for k, v in val_stats.items()},
+                         'epoch': epoch,
+                         'n_parameters': n_parameters}
 
-    # print("Start training for %d epochs" % args.epochs)
-    # start_time = time.time()
-    # for epoch in range(args.start_epoch, args.epochs):
-    #     if args.distributed:
-    #         data_loader_train.sampler.set_epoch(epoch)
-    #     if log_writer is not None:
-    #         log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
-    #     if wandb_logger:
-    #         wandb_logger.set_steps()
-    #     train_stats = train_one_epoch(
-    #         model, criterion, data_loader_train, optimizer,
-    #         device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
-    #         log_writer=log_writer, wandb_logger=wandb_logger, start_steps=epoch * num_training_steps_per_epoch,
-    #         lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-    #         num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-    #         use_amp=args.use_amp
-    #     )
-    #     if args.output_dir and args.save_ckpt:
-    #         if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
-    #             utils.save_model(
-    #                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-    #                 loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
-    #     if data_loader_val is not None:
-    #         test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-    #         print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-    #         if max_accuracy < test_stats["acc1"]:
-    #             max_accuracy = test_stats["acc1"]
-    #             if args.output_dir and args.save_ckpt:
-    #                 utils.save_model(
-    #                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-    #                     loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
-    #         print(f'Max accuracy: {max_accuracy:.2f}%')
+            # repeat testing routines for EMA, if ema eval is turned on
+            if args.model_ema and args.model_ema_eval:
+                val_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp, header='Val (EMA):')
+                print(f"Accuracy of the model EMA on {len(dataset_val)} validation images: {val_stats_ema['acc1']:.1f}%")
+                if max_accuracy_ema < val_stats_ema["acc1"]:
+                    max_accuracy_ema = val_stats_ema["acc1"]
+                    if args.output_dir and args.save_ckpt:
+                        utils.save_model(
+                            args=args, model=model, optimizer=optimizer,
+                            loss_scaler=loss_scaler, epoch="best-ema", model_ema=model_ema)
+                    print(f'Max EMA accuracy: {max_accuracy_ema:.2f}%')
+                if log_writer is not None:
+                    log_writer.update(val_acc1_ema=val_stats_ema['acc1'], head="perf", step=epoch)
+                log_stats.update({**{f'val_{k}_ema': v for k, v in val_stats_ema.items()}})
+        else:
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         'epoch': epoch,
+                         'n_parameters': n_parameters}
 
-    #         if log_writer is not None:
-    #             log_writer.update(test_acc1=test_stats['acc1'], head="perf", step=epoch)
-    #             log_writer.update(test_acc5=test_stats['acc5'], head="perf", step=epoch)
-    #             log_writer.update(test_loss=test_stats['loss'], head="perf", step=epoch)
+        if args.output_dir:
+            if log_writer is not None:
+                log_writer.flush()
+            with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
 
-    #         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-    #                      **{f'test_{k}': v for k, v in test_stats.items()},
-    #                      'epoch': epoch,
-    #                      'n_parameters': n_parameters}
+    total_time = time.time() - start_time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
 
-    #         # repeat testing routines for EMA, if ema eval is turned on
-    #         if args.model_ema and args.model_ema_eval:
-    #             test_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
-    #             print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
-    #             if max_accuracy_ema < test_stats_ema["acc1"]:
-    #                 max_accuracy_ema = test_stats_ema["acc1"]
-    #                 if args.output_dir and args.save_ckpt:
-    #                     utils.save_model(
-    #                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-    #                         loss_scaler=loss_scaler, epoch="best-ema", model_ema=model_ema)
-    #                 print(f'Max EMA accuracy: {max_accuracy_ema:.2f}%')
-    #             if log_writer is not None:
-    #                 log_writer.update(test_acc1_ema=test_stats_ema['acc1'], head="perf", step=epoch)
-    #             log_stats.update({**{f'test_{k}_ema': v for k, v in test_stats_ema.items()}})
-    #     else:
-    #         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-    #                      'epoch': epoch,
-    #                      'n_parameters': n_parameters}
-
-    #     if args.output_dir and utils.is_main_process():
-    #         if log_writer is not None:
-    #             log_writer.flush()
-    #         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-    #             f.write(json.dumps(log_stats) + "\n")
-
-    #     if wandb_logger:
-    #         wandb_logger.log_epoch_metrics(log_stats)
-
-    # if wandb_logger and args.wandb_ckpt and args.save_ckpt and args.output_dir:
-    #     wandb_logger.log_checkpoints()
-
-
-    # total_time = time.time() - start_time
-    # total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    # print('Training time {}'.format(total_time_str))
-
-
-
+    # final, one-off evaluation on the held-out test split using the best validation checkpoint
+    checkpoint_name = 'final epoch weights'
+    best_path = Path(args.output_dir) / 'checkpoint-best.pth' if args.output_dir else None
+    if best_path is not None and best_path.exists():
+        checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
+        model.load_state_dict(checkpoint['model'])
+        checkpoint_name = str(best_path)
+    extra = {
+        'best_val_acc1': max_accuracy,
+        'epochs_trained_this_run': args.epochs - args.start_epoch,
+        'training_time_this_run': total_time_str,
+        'max_gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 ** 2 if torch.cuda.is_available() else None,
+        'n_parameters': n_parameters,
+    }
+    run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name, extra)
 
 
 if __name__ == '__main__':

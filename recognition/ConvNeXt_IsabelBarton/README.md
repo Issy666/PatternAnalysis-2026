@@ -31,12 +31,13 @@
 | `--device` | `cuda` | Device to train/evaluate on (`cuda` or `cpu`). |
 | `--num_workers` | `4` | Number of DataLoader worker processes for loading images. |
 | `--pin_mem` | `True` | Pin CPU memory in the DataLoader for faster transfer to the GPU. |
+| `--use_amp` | `True` | Automatic mixed precision (float16 where safe); much faster on an RTX GPU. |
 
 ### Model
 
 | Argument | Default | Purpose |
 |---|---|---|
-| `--model` | `convnext` | Name of the model architecture to train. |
+| `--model` | `convnext_tiny` | Name of the model architecture to train (a model function in `modules.py`). |
 | `--input_size` | `256` | Height and width (pixels) images are resized to before entering the network. |
 | `--drop_path` | `0` | Stochastic depth rate (randomly drops residual blocks during training for regularisation). |
 | `--layer_scale_init_value` | `1e-6` | Initial value of ConvNeXt's per-channel layer scale parameters. |
@@ -109,15 +110,16 @@
 |---|---|---|
 | `--output_dir` | `/home/isabel/Desktop/results` | Where checkpoints and logs are saved; empty for no saving. |
 | `--log_dir` | `/home/isabel/Desktop/log` | Where TensorBoard logs are written. |
+| `--save_ckpt` | `True` | Save checkpoints to `--output_dir` (`checkpoint-best.pth` is the best validation epoch). |
+| `--save_ckpt_freq` | `1` | Save an epoch checkpoint every N epochs. |
+| `--save_ckpt_num` | `3` | Number of recent epoch checkpoints to keep. |
+| `--resume` | `''` | Checkpoint to resume training from, or to evaluate with `--eval True`. |
+| `--auto_resume` | `True` | Resume from the latest checkpoint in `--output_dir` if one exists. |
 | `--finetune` | `''` | Path or URL of a checkpoint to fine-tune from. |
 | `--model_key` | `model\|module` | Key(s) to look for in the checkpoint's state dict. |
 | `--model_prefix` | `''` | Prefix to strip from checkpoint parameter names when loading. |
-| `--eval` | `False` | Only evaluate a trained model (no training). |
+| `--eval` | `False` | Only evaluate a trained model on the test set (no training). |
 | `--disable_eval` | `False` | Skip validation during training. |
-| `--dist_eval` | `True` | Use distributed evaluation across multiple GPUs. |
-| `--enable_wandb` | `False` | Log to Weights & Biases. |
-| `--project` | `convnext` | Weights & Biases project name. |
-| `--wandb_ckpt` | `False` | Upload checkpoints to Weights & Biases as artifacts. |
 
 -----------------------------------------------------
 
