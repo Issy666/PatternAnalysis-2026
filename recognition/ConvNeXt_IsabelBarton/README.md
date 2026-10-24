@@ -136,36 +136,32 @@ The purpose of this project is to develop a ConvNeXt model as a prototype machin
 ### Acceptance Criteria
 The minimum acceptance criteria are as follows:
 - Minimum classification test accuracy of 80% for AD versus CN.
-  *Test:* accuracy of the ADNI `test` split.
+  *Test:* accuracy of the ADNI test split.
 - A bias towards false positives over false negatives for misclassifications (missing AD is worse than a false alarm).
-  *Test:* AD recall (sensitivity) ≥ CN recall (specificity), from the confusion matrix (records TP, TN, FP, FN for test data), along with per-class precision, recall and macro-F1 (accuracy for each class).
-- Can identify ambiguous vs confident classifications, where confidence should correlates with diagnostic correctness.
-  *Test:* reliability diagram (test predictions sorted via confidence bins for each classification and plot the actual accuracy for the corrosponding confidence level) and Expected Calibration Error (ECE). A reject threshold that routes ≤ 20% of boundary cases to a human.
+  *Test:* AD recall ≥ CN recall, from the confusion matrix (records TP, TN, FP, FN for test data), along with per-class precision, recall and macro-F1 (accuracy for each class).
+- Can identify ambiguous vs confident classifications, where confidence correlates with diagnostic correctness.
+  *Test:* reliability diagram (test predictions sorted via confidence bins for each classification and plot the actual accuracy for the corrosponding confidence level). A reject threshold that routes <= 20% of boundary cases to a human.
 - Can extract discriminative anatomical biomarkers in the latent space despite variation in head shape and age between patients.
-  *Test:* Grad-CAM maps focus on brain anatomy (e.g. ventricles, hippocampus/medial temporal lobe) rather than the background or image border.
-- Avoid patient data leakage via patient-level separation of medical images.
-  *Test:* automated check that no patient ID appears in more than one split.
-- Operational/resource constraint: trains on a single RTX 3080 in ≤ 12 h, with inference ≤ 20 ms per slice.
-  *Test:* `torch.cuda.max_memory_allocated()`, wall-clock training time, and a timed inference loop.
+  *Test:* Grad-CAM maps focus on brain anatomy rather than the background or image border.
 - Benchmark against the original "A ConvNet for the 2020s" paper [1], and against a simple baseline CNN on the same splits.
 
 ### Model Choice
 
-Model: ConvNeXt-T (Tiny) [1]. Difficulty Band: Hard.
+Model: ConvNeXt [1]. Difficulty Band: Hard.
 
 The model architecture and pipeline will be as follows. Where possible I use the same macro/micro design and hyperparameters as the paper [1], and I note where they have to change for this dataset and hardware.
 
 1. Data preparation
-- Data collection: course-supplied ADNI AD_NC dataset (`/home/groups/comp3710/ADNI`). The images are 2D greyscale JPEG slices of 256x240 px, with 20 slices per patient. Filenames follow `<patientID>_<sliceID>.jpeg`.
+- Data collection: supplied ADNI AD_NC dataset (`/home/groups/comp3710/ADNI`). The images are 2D greyscale JPEG slices of 256x240 px, with 20 slices per patient. Filenames follow `<patientID>_<sliceID>.jpeg`.
 - Data split: Training/validation/testing. 
-- Data balancing: the classes are close to balanced (about 48% AD in every split). If poor performance may need to look at MRI distribution split.
+- Data balancing: the classes are close to balanced (about 48% AD in every split). 
 - Data shuffling: training data is shuffled each epoch. Validation and test sets are not shuffled.
 - Data labelling: labels come from the folder names (`AD` = 0, `NC` = 1).
 
 2. Data Preprocessing
-- Normalisation: 
+- Normalisation: Calculation the mean and standaard divation of the data set and normalise the values
 - Regularisation (paper settings): weight decay 0.05, Stochastic Depth (drop path 0.1 for ConvNeXt-T), Label Smoothing 0.1, Layer Scale 1e-6.
-- Batching: the paper uses a batch size of 4096, which does not fit on one GPU. I will use 64-128 with gradient accumulation and scale the learning rate linearly with batch size.
+- Batching: the paper uses a batch size of 4096, which does not fit on one GPU. I will use 32-128 with gradient accumulation and scale the learning rate linearly with batch size.
 - Augmentation (paper settings): RandAugment (9, 0.5), Mixup 0.8, CutMix 1.0, Random Erasing 0.25. Mixup/CutMix blend two brains together and may hide anatomy, so I will test the model with and without them.
 
 3. Network Architecture: ConvNeXt
@@ -177,13 +173,13 @@ The model architecture and pipeline will be as follows. Where possible I use the
 
 4. Training Procedure
 - Optimiser: AdamW (uses momentum and adaptive learning rates to help find the minimum, with decoupled weight decay), weight decay 0.05.
-- Learning Rate: paper base LR of 4e-3 (for batch size 4096) with a linear warmup (20 epochs in the paper) and cosine decay. Scaled down to my batch size, with fewer warmup epochs because the dataset is smaller.
-- Epochs: the paper uses 300. I will tune this on validation (expected ~50-100).
+- Learning Rate: paper base LR of 4e-3.
+- Epochs: the paper uses 300. I will tune this on validation (expected 50-100).
 - Cost/Loss Function: cross-entropy with label smoothing over 2 classes (binary classification: AD vs CN). The softmax output is used as the confidence score.
 
 5. Evaluation Procedure:
 - Training and validation: loss and accuracy plots, including "Training vs Validation Loss" (loss against epochs) and "Training vs Validation Accuracy" (accuracy against epochs). These plots help detect overfitting or underfitting.
-- Performance Metrics: accuracy, per-class precision, recall, macro-F1, AUROC and the confusion matrix. For the dilemma: a reliability diagram, ECE, and accuracy against rejection-rate curves to choose a confidence threshold.
+- Performance Metrics: accuracy, per-class precision, recall, macro-F1, and the confusion matrix. For the open question: a reliability diagram, and accuracy against rejection-rate curves to choose a confidence threshold.
 - Visualisation of Predictions: use activation maps (Grad-CAM) to determine how the model chose between the image classes.
 
 6. Testing Procedure:
@@ -197,9 +193,9 @@ The model architecture and pipeline will be as follows. Where possible I use the
 
 Dataset: ADNI dataset
 
-The ADNI dataset provides structural MRI scans that can be preprocessed to include only the Alzheimer's disease and Cognitively Normal classes, accessible via the ADNI portal [3]. The full ADNI cohort has 591 subjects with Alzheimer's disease and 1479 cognitively normal subjects, with approximately a 50/50 split in sex and an age split of 1552 aged 70-79, 1059 aged 60–69, 539 aged 80–89, 214 aged 50–59 and 31 above 89. *(TODO: cite the source of these cohort statistics. The course subset used here is smaller, see below.)*
+The ADNI dataset provides structural MRI scans that can be preprocessed to include only the Alzheimer's disease and Cognitively Normal classes, accessible via the ADNI portal [3]. The full ADNI cohort has 591 subjects with Alzheimer's disease and 1479 cognitively normal subjects, with approximately a 50/50 split in sex and a varied age split.
 
-The course subset used in this project contains 1,526 patients (743 AD, 783 CN). The data will be split into 3 sets, with each patient's data strictly confined to a single split to avoid data leakage:
+The course subset used in this project contains 1,526 patients (743 AD, 783 CN). The data will be split into 3 sets, with each patient's data confined to a single split to avoid data leakage:
 
 | Split | AD slices | NC slices | AD patients | NC patients |
 |-------|----------:|----------:|------------:|------------:|
@@ -207,26 +203,16 @@ The course subset used in this project contains 1,526 patients (743 AD, 783 CN).
 | Validate (15% of the original train set, by patient) | 1,560 | 1,660 | 78 | 83 |
 | Test | 4,460 | 4,540 | 223 | 227 |
 
-Data audit: train ∩ validation and train ∩ test share 0 patients (checked by patient ID).
-
 ### Course Concepts
 Key course concepts that will help in building this model include:
 - Convolutional Neural Networks (a class of deep learning models suited to image processing):
-    - Inductive Biases: assumptions built into an algorithm, such as translational equivariance and local connectivity (connecting the pixels in a small region to a neuron), which come from convolution and help with image recognition. *Why it matters here:* atrophy patterns (an enlarged ventricle, a shrunken hippocampus) are local shapes and textures that can appear at slightly different positions between patients. With only ~1,500 patients, a CNN needs less data than a Vision Transformer.
-    - Receptive Fields: the region of the input that a neuron sees. Convolution allows the identification of edges at different orientations and simple textures, particularly in the early learned kernels. ConvNeXt uses large 7×7 depthwise kernels to widen the receptive field cheaply.
+    - Inductive Biases: assumptions built into an algorithm, such as translational equivariance and local connectivity (connecting the pixels in a small region to a neuron), which come from convolution and help with image recognition. *Why it matters here:* patterns (an enlarged ventricle, a shrunken hippocampus) are local shapes that can appear at slightly different positions between patients. With only ~1,500 patients, a CNN needs less data than a Vision Transformer.
     - Kernel: a learned filter that starts from initial values and is then updated according to gradients to reduce classification loss/error.
     - Feature Map: the result of convolving a kernel with the input. It is a filtered version of the input that highlights the feature detected by the filter.
     - Padding: adds extra pixels to stop convolution from shrinking the feature map and to allow features to be detected at the edges of the input.
     - Stride: downsamples the input and captures more global features by skipping positions (the kernel moves more than one pixel at a time). ConvNeXt's patchify stem is a 4×4 conv with stride 4.
     - Layers: apply all the kernels to the input to get a set of feature maps, then apply new kernels to those feature maps, and so on. Each new set of feature maps is a new layer. Early layers capture fine-grained details like edges, middle layers detect textures and shapes, and deeper layers extract abstract features.
-    - Transposed Convolution: increases spatial dimensions by upsampling (not used in ConvNeXt classification, but used in the U-Net fallback).
     - Pooling Layers: downsample the feature map by reducing spatial dimensions, using either average pooling (the average value in a region) or max pooling (the maximum value in a region). This reduces noise and improves memory efficiency. ConvNeXt uses global average pooling before the classifier head.
-    - Dilated convolution: expands the receptive field by applying the kernel to pixels that are spaced apart rather than neighbouring. This covers a larger area without adding parameters.
-- CNN Visualisation Methods
-    - Visualise filters: plot the learned filters for early and deep layers to see whether they match the expected pattern of edge detection early and abstract features later.
-    - Activation Maps: the response of a feature channel to a particular input. Helps detect which feature is being selected for.
-    - Class activation mapping (Grad-CAM): helps visualise which regions of an input image are most relevant to the classification decision, which parts of an image a CNN uses to make that decision, and how to interpret the model and explain its findings, especially to verify what the model is doing.
-- Image Classification (Discrimination Tasks): predict a single class for an entire image.
 - Training:
     - Dropout: randomly disable neurons during training, forcing neurons to learn independently. This reduces overfitting and improves generalisability. ConvNeXt uses Stochastic Depth, a related method that randomly drops whole residual blocks.
     - Layer Normalisation: normalises across all channels at each spatial position in a layer, shifting the data back to a normalised distribution to improve convergence. ConvNeXt uses LayerNorm instead of BatchNorm.
@@ -241,11 +227,7 @@ Key course concepts that will help in building this model include:
 How course concepts and literature support the choices:
 - The paper [1] shows that a pure ConvNet with these modernised design choices matches or beats the Swin Transformer on ImageNet at similar compute (ConvNeXt-T 82.1% vs Swin-T 81.3%). It keeps the convolution inductive biases above, which matter more on a small medical dataset than on ImageNet.
 - Prior ConvNeXt work on Alzheimer's MRI suggests the 80% target is achievable:
-  - A ConvNeXt implementation on ADNI AD vs CN slices reports 80.9% test accuracy, but with AD recall of only 0.696 against NC recall of 0.921 [4]. This is the same false-negative bias seen in my smoke test.
   - ConvNeXt-Base reaches 98.37% accuracy (AUC 0.992) on coronal slices, against about 92% on axial and sagittal slices [5], [8]. However, this was on a different, small and imbalanced dataset (AlzaSet: 79 subjects, 63 AD and 16 NC) [9].
-  - CA-ConvNeXt adds coordinate attention to ConvNeXt for early AD classification [7]. *(TODO: add its reported accuracy.)*
-  - NeuroScan benchmarks 25+ pretrained CNN and Transformer backbones, including ConvNeXt, ResNet, ViT and Swin, through `timm` [6].
-- Grad-CAM from the course visualisation methods directly supports the open dilemma, because it shows whether a confident prediction rests on anatomy or on artefacts.
 
 ### Preliminary Feasibility Evidence
 Smoke test: I tested the baseline code from the paper's official repository [2], starting from ImageNet-1K pre-trained initial weights and fine-tuning on my ADNI dataset on a CPU. This checks that the data pipeline and training loop work end to end. The only code changes were adding an `ADNI` dataset option.
@@ -266,17 +248,6 @@ nohup python -u main.py \
   --auto_resume true \
   > train_cpu.log 2>&1 &
 ```
-
-Why each setting:
-- `--finetune <url>` loads ImageNet-pretrained ConvNeXt-T weights, so the model converges in a few epochs on a CPU.
-- `--epochs 11 --warmup_epochs 1`: a short run with a 1-epoch linear warmup, then cosine decay (the same schedule shape as the paper).
-- `--lr 1e-4` is a typical fine-tuning rate (the paper fine-tunes at 5e-5).
-- `--batch_size 16 --update_freq 4`: gradient accumulation gives an effective batch size of 64 while fitting in CPU memory.
-- `--input_size 128`: smaller than the paper's 224, which cuts compute by about 3× so the run finishes on a CPU.
-- `--drop_path 0.1`: stochastic depth, the paper's value for ConvNeXt-T.
-- `--mixup 0 --cutmix 0` turns off Mixup and CutMix augmentation. The repo defaults still apply RandAugment (`rand-m9-mstd0.5-inc1`), Random Erasing (0.25), colour jitter (0.4), label smoothing (0.1) and weight decay (0.05).
-- `--device cpu`: no GPU was used for this smoke test.
-- `nohup ... &` keeps the run going if the terminal is closed. A checkpoint is saved every epoch, and `--auto_resume` continues from the last one if the run is interrupted.
 
 Monitoring it:
 - `tail -f train_cpu.log` shows progress.
@@ -330,17 +301,15 @@ Accuracy of the network on 9000 test images: 75.56667%
 
 What this shows:
 1. The pipeline works end to end and the model is learning: validation loss falls from 0.42 to 0.20 over 11 epochs.
-2. Test accuracy (75.6%) is **below the 80% target**. Most errors are AD scans predicted as CN (false negatives), which is the opposite of the "bias towards false positives" criterion.
-3. There is a **17-point gap between validation (92.8%) and test (75.6%)**. Validation patients come from the same pool as train, so validation may be easier than test. The input resolution was also only 128². Validation accuracy alone therefore cannot be trusted for model selection or threshold tuning. This must be investigated next.
+2. Test accuracy (75.6%) is **below the 80% target**. Most errors are AD scans predicted as CN (false negatives), which is the opposite to the desired outcome.
 4. Grad-CAM often highlights the ventricles and medial temporal region (plausible AD biomarkers). Some maps also highlight the image border or background, which suggests shortcut learning.
 
 ### Risks
 The key risks are:
-- The model may take a long time to train, leaving too little time to fine-tune the parameters to meet the minimum accuracy requirement. The paper trains for 300 epochs, and the CPU smoke test took ~5 h for 11 epochs at 128². *Mitigation:* train on GPU with mixed precision (AMP), start from ImageNet weights, and run short sweeps before long runs.
-- The smoke test is already below 80% on test and is biased towards false negatives. *Mitigation:* train at 224² for longer, aggregate the 20 slices of each patient into one patient-level prediction, use temperature scaling for calibration, and set the decision threshold to favour AD recall.
-- The validation set may not represent the test set (17-point gap). *Mitigation:* investigate the split (e.g. patient-level k-fold), and never tune on the test set.
+- The model may take a long time to train, leaving too little time to fine-tune the parameters to meet the minimum accuracy requirement. The paper trains for 300 epochs, and the CPU smoke test took ~5 h for 11 epochs at 128². *Mitigation:* train on GPU, start from ImageNet weights as tests, and run short test before long runs.
+- The smoke test is below 80% on test and is biased towards false negatives. *Mitigation:* train at 224² for longer, aggregate the 20 slices of each patient into one patient-level prediction and set the decision threshold to favour AD recall.
+- The validation set may not represent the test set. *Mitigation:* investigate the split.
 - I have not yet tested running a Swin Transformer, so I may not be able to benchmark against the Swin Transformer myself. *Mitigation:* use the paper's published Swin-T numbers for comparison. The task sheet only requires a simple baseline CNN, which is lower risk.
-- Data leakage when using ADNI datasets not provided by the course (e.g. the Zenodo dataset). *Mitigation:* split by patient ID with the same automated overlap check.
 
 ### Computing Budget
 There are three compute options:
@@ -348,28 +317,25 @@ There are three compute options:
 - RTX2040 (lab computers, limited access)
 - Rangpur A100 (dependent on demand and queue times)
 
-The "A ConvNet for the 2020s" foundation paper measured inference throughput on V100 GPUs and training memory with a per-GPU batch size of 32. In Appendix E it also benchmarks on A100 GPUs (TF32 tensor cores, channels-last memory layout), where ConvNeXt's speed advantage over the Swin Transformer is much larger: ConvNeXt-T runs at 1943.5 img/s vs 1325.6 img/s for Swin-T (+47%), and up to +49% for larger models.
+The "A ConvNet for the 2020s" foundation paper measured inference throughput on V100 GPUs and training memory with a per-GPU batch size of 32. ConvNeXt-T runs at 1943.5 img/s vs 1325.6 img/s for Swin-T (+47%), and up to +49% for larger models.
 
-Therefore, the RTX 3080 will be used for development and testing, as it is easy to access. Initial benchmark tests (ConvNeXt vs baseline: VRAM, training time, inference latency) will also be run on the RTX 3080 so the numbers are comparable. If time allows, these tests will be repeated on the Rangpur A100, provided queue lengths are reasonable.
+Therefore, the RTX 3080 will be used for development and testing, as it is easy to access. Initial benchmark tests (ConvNeXt vs baseline: VRAM, training time, inference latency) will also be run on the RTX 3080 so the numbers are comparable.
 
 ### Next Planned Experiment
 The next planned experiment is to modify the original paper's ConvNeXt to process ADNI MRI scans, combining techniques from:
-- Huynh, Alzheimers-MRI-ConvNext (GitHub) [4]
 - Basereh et al., ConvNeXt-driven detection of AD across anatomical planes (*Diagnostics*, 2025) [5]
 - Vyas, NeuroScan / adni_code (GitHub) [6]
 - Jin et al., CA-ConvNeXt (Intelligence Science IV, 2022) [7]
 - Basereh et al., bioRxiv preprint of [5] [8]
 
-I will write my own ConvNeXt-T in `modules.py` (following the paper's architecture) along with `dataset.py`, `train.py` and `predict.py`. I will then run this model without pre-training on the RTX 3080, and compare it with the ImageNet-pretrained version from the smoke test. Hyperparameters and parameters will be fine-tuned from there to reach the required minimum test accuracy of 0.8. A simple baseline CNN will be trained on the same splits for comparison.
+I will write my own ConvNeXt in `modules.py` (following the paper's architecture) along with `dataset.py`, `train.py` and `predict.py`. I will then run this model without pre-training on the RTX 3080, and compare it with the ImageNet-pretrained version from the smoke test. Hyperparameters and parameters will be fine-tuned from there to reach the required minimum test accuracy of 0.8.
 
-I will then use visualisation techniques (Grad-CAM, activation maps) to test how the model classifies the images, and calibration plots to check whether its confidence matches its correctness.
-
-If this is successful, I will test how the data affects the model by using the AlzaSet dataset [9] (the dataset behind [5]) to check whether including coronal, sagittal and axial MRI slices improves model accuracy. This would indicate which angle of brain slice is most informative for Alzheimer's detection.
+If time allows I would like to test how the data affects the model by using the AlzaSet dataset [9] (the dataset behind [5]) to check whether including coronal, sagittal and axial MRI slices improves model accuracy. This would indicate which angle of brain slice is most informative for Alzheimer's detection.
 
 ### Fallback
 If the ConvNeXt project takes too long to train, or fails to produce viable results, I will revert to project 2.2 "Segmentation: Anatomical Contouring and Radiotherapy Planning" with U-Net (2D U-Net / Improved U-Net on OASIS is Easy difficulty, capped at 10/20 for implementation).
 
-The U-Net architecture is also based on convolution, the same as ConvNeXt. It contains an encoder, a bottleneck and a decoder, forming a U-shaped structure. The encoder uses 3×3 kernels for feature scanning, simple ReLU activation functions for non-linearity, and 2×2 max pooling to reduce the image size. The decoder then upsamples (using transposed convolution) to increase the image size back to the original dimensions. Skip connections bring in information from the encoder to recover spatial detail, and final convolution layers clean up the output. It performs segmentation by classifying each pixel as a certain "class", which delineates the segment it belongs to.
+The U-Net architecture is also based on convolution, the same as ConvNeXt. It contains an encoder, a bottleneck and a decoder, forming a U-shaped structure. 
 
 This project similarly looks at brain tissue slices. However, it focuses on delineating cortical grey matter, white matter and cerebrospinal fluid across 2D slices, whereas ConvNeXt aims to classify the entire image as either Cognitively Normal or Alzheimer's.
 
