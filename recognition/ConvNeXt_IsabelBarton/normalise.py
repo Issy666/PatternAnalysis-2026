@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from timm.data import create_transform
+from timm.data.random_erasing import RandomErasing
 from torchvision import transforms
 
 import numpy as np
@@ -167,8 +167,8 @@ def build_transform(is_train,
     Parameters
     ----------
     is_train : bool
-        If True, returns the timm augmentation pipeline (random crop/flip,
-        colour jitter, RandAugment, random erasing). Requires args.
+        If True, returns the training augmentation pipeline (small random
+        affine + random erasing). Requires args.
     img_size : int
         Output height and width.
 
@@ -176,21 +176,28 @@ def build_transform(is_train,
     is never stretched.
     """
     if is_train:
-        # this should always dispatch to transforms_imagenet_train
-        timm_transform = create_transform(
-            input_size=img_size,
-            is_training=True,
-            color_jitter=args.color_jitter,
-            auto_augment=args.aa,
-            interpolation=args.train_interpolation,
-            re_prob=args.reprob,
-            re_mode=args.remode,
-            re_count=args.recount,
-            mean=stats["mean"],
-            std=stats["std"],
-        )
-        # pad before timm's random resized crop so crops are taken from an undistorted square image
-        return transforms.Compose([PadToSquare(), *timm_transform.transforms])
+        # ADNI-specific instead of the paper's ImageNet pipeline (RandomResizedCrop 8-100% + horizontal flip):
+        # AD shows up as SIZE/SHAPE changes (bigger ventricles, smaller hippocampus), so augmentation only mimics
+        # small differences in head position and never zooms, stretches or mirrors the brain (see README)
+        interpolation = {'bilinear': transforms.InterpolationMode.BILINEAR,
+                         'bicubic': transforms.InterpolationMode.BICUBIC,
+                         'nearest': transforms.InterpolationMode.NEAREST}[args.train_interpolation]
+        return transforms.Compose([
+            PadToSquare(),
+            transforms.Resize((img_size, img_size), interpolation=interpolation), # no-op at 256 (same as eval)
+            transforms.RandomAffine(
+                degrees=args.affine_degrees,                               # rotate +-10 deg (head tilt)
+                translate=(args.affine_translate, args.affine_translate),  # shift up to +-5% (~13 px at 256)
+                scale=(1 - args.affine_scale, 1 + args.affine_scale),      # 0.95-1.05 (head size / scanner FOV)
+                interpolation=interpolation,
+                fill=0,                                                    # new corners are black, like the background
+            ),
+            # no horizontal flip: every sagittal slice faces the same way, and a mirrored brain never appears at test
+            transforms.ToTensor(),
+            transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+            # erase one random rectangle (filled with random noise) in 25% of images, after normalisation as in timm
+            RandomErasing(probability=args.reprob, mode=args.remode, max_count=args.recount, device='cpu'),
+        ])
 
     t = []
     t.append(PadToSquare())

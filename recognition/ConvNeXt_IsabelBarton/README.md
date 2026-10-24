@@ -462,7 +462,7 @@ The value in brackets is the average so far in that epoch. The learning rate is 
 **Gradient accumulation.** With `--update_freq N`, the optimizer only steps on every N-th batch, and `zero_grad()` is not called in between, so the gradients of the N batches add up. Each batch's loss is divided by N first, so the summed gradient equals the gradient of the average loss, the same as one batch N times larger. This only matters when a batch doesn't fit in GPU memory. The default is `--update_freq 1`, so every batch is one step.
 **Logging.** After each step, the loop records the batch loss, the batch training accuracy (the fraction of slices whose highest logit matches the label), the learning rate, the weight decay of the `decay` group and `grad_norm`, the total gradient size before clipping. `grad_norm` is useful in the learning-rate sweep, because large spikes indicate a learning rate that is too high. The same values go to TensorBoard every step if `--log_dir` is set. The logged `min_lr` is the smallest learning rate across the parameter groups, a leftover from layer-wise learning-rate decay in the original repository. Both groups now use the same rate, so it always equals `lr`, and it is not the same as `--min_lr`. At the end of the epoch, `train_one_epoch` returns the epoch averages, which `main.py` writes to `log.txt` as `train_loss`, `train_class_acc` and so on, and `plot_log.py` plots.
 
-**Training accuracy understates the overfitting gap.** It is measured in training mode (DropPath randomly skips blocks) on augmented images (random crops and random erasing), and averaged over an epoch in which the weights keep changing. Evaluated in `eval` mode on the same images, the model would score higher. So when training accuracy is 85% and validation is 77%, the real gap between how well the model fits the training data and how well it generalises is larger than 8 points.
+**Training accuracy understates the overfitting gap.** It is measured in training mode (DropPath randomly skips blocks) on augmented images (random affine and random erasing), and averaged over an epoch in which the weights keep changing. Evaluated in `eval` mode on the same images, the model would score higher. So when training accuracy is 85% and validation is 77%, the real gap between how well the model fits the training data and how well it generalises is larger than 8 points.
 
 `torch.cuda.synchronize()` waits for the GPU to finish each batch so the logged timings are correct.
 
@@ -478,7 +478,7 @@ The loss here is **plain cross-entropy without label smoothing**, unlike trainin
 
 For each slice, softmax turns the 2 logits into probabilities that add up to 1, converted to float32 first so values near 0 or 1 stay precise. These are the confidence scores for the open research dilemma, returned in loader order, which matches the file list in `test_predictions.csv` because the loaders don't shuffle. The predicted class is the argmax, which is the same as a 0.5 threshold on `prob_AD`. Moving this threshold is one way to favour AD recall.
 
-**Metrics (`binary_metrics`).** AD is the positive class (the condition being detected). It is class 0 because `ImageFolder` numbers the class folders alphabetically (`AD`, `NC`). From the predictions and labels, the confusion matrix is built. With the first from-scratch run's test results:
+**Metrics (`binary_metrics`).** AD is the positive class (the condition being detected). It is class 0 because `ImageFolder` numbers the class folders alphabetically (`AD`, `NC`). From the predictions and labels, the confusion matrix is built. With the first from-scratch run's test results (on the original 9,000-slice test set, before the corrupted patient was removed; see "Data cleaning"):
 
 | | Predicted AD | Predicted NC |
 |---|---|---|
@@ -498,21 +498,52 @@ F1 is the harmonic mean of precision and recall, so it is only high when both ar
 **AD recall is the key metric.** The acceptance criterion is AD recall ≥ NC recall, because missing Alzheimer's (a false negative) is worse than a false alarm. The first run fails it clearly: it misses more than half of the AD slices and leans towards predicting NC.
 
 Two caveats:
-- **These are slice-level metrics.** Each patient contributes 20 slices, which aren't independent, so one patient can produce up to 20 errors. Patient-level results (averaging each patient's 20 `prob_AD` values before thresholding) are the clinically meaningful version, and will be computed in `predict.py` from `test_predictions.csv`.
+- **These are slice-level metrics.** Each patient contributes 20 slices, which aren't independent, so one patient can produce up to 20 errors. Patient-level results (averaging each patient's 20 `prob_AD` values before thresholding) are the clinically meaningful version, and are computed by `predict.py` from `test_predictions.csv` (see "Patient-level metrics").
 - **All of these use the 0.5 threshold.** Lowering the AD threshold (e.g. predicting AD when `prob_AD > 0.3`) trades false negatives for false positives, raising AD recall and lowering NC recall. The threshold must be chosen on the validation set and reported once on test.
 
 ### Augmentation and Regularisation
 
 | Argument | Default | Purpose |
 |---|---|---|
-| `--aa` | `''` (off) | AutoAugment/RandAugment policy, e.g. `rand-m9-mstd0.5-inc1`. |
-| `--color_jitter` | `0` (off) | Strength of random brightness/contrast/saturation changes. |
-| `--train_interpolation` | `bilinear` | Interpolation used when resizing training images (`random`, `bilinear`, `bicubic`). |
+| `--affine_degrees` | `10` | Random rotation, ±degrees. |
+| `--affine_translate` | `0.05` | Random shift, ± fraction of the image size (±13 px at 256). |
+| `--affine_scale` | `0.05` | Random zoom, between 1 − value and 1 + value (0.95–1.05). |
+| `--train_interpolation` | `bilinear` | Interpolation used by the training resize and affine (`bilinear`, `bicubic`, `nearest`). |
 | `--smoothing` | `0.1` | Label smoothing applied to the loss. |
 | `--reprob` | `0.25` | Probability of applying random erasing to a training image. |
 | `--remode` | `pixel` | Random erasing mode (what the erased region is filled with). |
 | `--recount` | `1` | Number of regions erased per image. |
 | `--crop_pct` | `None` | Centre crop ratio used at evaluation time. |
+
+#### Training augmentation: a small random affine instead of ImageNet's crop and flip
+
+The ConvNeXt paper trains with timm's ImageNet pipeline, which applies `RandomResizedCrop` and a random horizontal flip to every image. Both were removed for ADNI and replaced with one small `RandomAffine` (`normalise.build_transform`):
+
+```
+PadToSquare → Resize(256) → RandomAffine(±10°, shift ±5%, scale 0.95–1.05, black fill)
+            → ToTensor → Normalize → RandomErasing(p = 0.25)
+```
+
+**Why not `RandomResizedCrop`.** It picks a random patch covering anywhere from **8% to 100%** of the image, stretches it by up to ±33% in one direction, and resizes it to 256×256. On ImageNet this teaches the model that a dog is a dog at any size or position in the photo. For brain MRI, it works against the task:
+- **The AD signal is size and shape.** Alzheimer's appears as enlarged ventricles, a shrunken hippocampus and wider gaps between the folds of the cortex. Random zooming and stretching change how big these structures look in every training image, so the model is trained to *ignore* exactly the differences it is supposed to detect.
+- **Training and test images no longer match.** Validation and test images are never cropped: the model always sees the whole brain at its true scale. With a crop as small as 8%, many training images are a magnified piece of brain that looks nothing like a test image.
+- **A small crop can cut out the important region** (e.g. the hippocampus) while keeping the patient's AD label, which teaches the model from a misleading example.
+
+**Why no horizontal flip.** The slices are sagittal (side views), and every brain in the dataset faces the same way. A flipped training image faces the opposite direction, which never appears in validation or test. The model would spend capacity learning both orientations for no benefit.
+
+**What the random affine does instead.** It mimics the small differences in how a head sits in the scanner, without changing the anatomy:
+
+| Change | Range | Real-world variation it mimics |
+|---|---|---|
+| Rotation | ±10° | Head tilted slightly forwards or backwards |
+| Shift | ±5% (about ±13 px) | Head not perfectly centred in the field of view |
+| Scale | 0.95–1.05 | Small differences in head size and scanner field of view |
+
+The scale range is kept to ±5% on purpose: it's small compared with the size differences atrophy causes, so the model can't simply learn "big ventricles = AD" from the zoom level. Corners exposed by the rotation or shift are filled with black (0), the same as the background. Evaluation still uses the original images, with no augmentation.
+
+**Random erasing** is kept from the paper. With probability 0.25 it replaces one random rectangle with noise (after normalisation), so the model can't rely on any single small region. It's the only augmentation that hides anatomy, and it's applied to only a quarter of the images.
+
+The other ImageNet augmentations stay off, and their arguments (`--aa`, `--color_jitter`) were removed. RandAugment includes colour, solarise and posterise operations that make no sense for greyscale MRI intensities, and colour jitter would change the tissue contrast that separates grey matter, white matter and cerebrospinal fluid.
 
 #### Loss function
 
@@ -608,7 +639,7 @@ python3 main.py --eval True \
   --output_dir ~/Desktop/results/convnext_t_scratch_eval
 ```
 
-`run_test` runs the model on all 9,000 test slices and saves 2 files to `--output_dir`:
+`run_test` runs the model on all test slices (8,980 after data cleaning, 9,000 in the first run) and saves 2 files to `--output_dir`:
 
 | File | Contents |
 |---|---|
@@ -627,6 +658,136 @@ This row, from the first from-scratch run, is an AD slice that the model called 
 Two things to watch:
 - **Always pass `--resume .../checkpoint-best.pth`.** Without it, `--auto_resume` loads the *latest* epoch checkpoint, not the best one. If no checkpoint is found, the random initial weights are tested (about 50% accuracy) and recorded as `initial weights`.
 - **Use a new `--output_dir`.** Evaluating into the training run's folder overwrites its `test_results.json`, which also records the training time and best validation accuracy.
+
+#### Running `predict.py`
+
+`predict.py` can also be run on its own, and it works on a CPU (`main.py` needs a GPU). It has two modes:
+
+```bash
+# 1. run a trained checkpoint on the test set, then analyse the predictions
+python3 predict.py --resume ~/Desktop/results/convnext_t_scratch/checkpoint-best.pth
+
+# 2. analyse an existing test_predictions.csv (no model, no GPU, takes seconds)
+python3 predict.py --predictions ~/Desktop/results/convnext_t_scratch/test_predictions.csv
+```
+
+- **Mode 1** reuses `main.py`'s arguments, so the model and the test transforms are built exactly as they were in training. Pass the same `--model` and `--input_size` used for the run. It calls `run_test` and writes into a `predict/` subfolder next to the checkpoint, so the training run's own `test_results.json` isn't overwritten.
+- **Mode 2** writes its outputs next to the CSV.
+- Both modes accept `--output_dir`, which overrides where the files go, `--threshold`, `--n_bins` and `--reject_rate`.
+- Both modes save `patient_results.json`, `patient_predictions.csv`, `calibration.json`, `reliability_diagram.png`, `reject_curve.json`, `reject_curve.png` and `example_predictions.png`.
+
+#### Patient-level metrics
+
+Each test patient has 20 slices, but a diagnosis is made per **patient**, not per slice. The 20 slices of one brain are also highly correlated, so slice-level metrics count one patient's mistake up to 20 times. `predict.py` combines the slices into one prediction per patient:
+
+1. It takes the patient ID from each filename (`<patientID>_<sliceID>.jpeg`, e.g. `1003730_100.jpeg` → patient `1003730`).
+2. It **averages `prob_AD`** over that patient's slices. Averaging probabilities rather than taking a majority vote keeps how confident each slice was, so the result is still a probability. That matters for calibration and the reject threshold later.
+3. It predicts AD if the average is above `--threshold` (default 0.5), and computes the same metrics as `binary_metrics`.
+4. As a sanity check, it stops with an error if one patient's slices have different labels, because that would mean the split mixed patients across folders.
+
+It saves 2 files:
+
+| File | Contents |
+|---|---|
+| `patient_results.json` | Patient-level accuracy, AD/NC recall and precision, macro-F1, confusion matrix and the threshold used |
+| `patient_predictions.csv` | One row per patient: ID, true label, prediction, mean `prob_AD`, number of slices, and the fraction of slices the slice-level model called AD |
+
+The first from-scratch run (`convnext_t_scratch`), at the 0.5 threshold. This and the calibration, reject curve and example results below all use the original test set (9,000 slices, 450 patients), which still included the corrupted patient `985197` that was later removed (see "Data cleaning"):
+
+| Level | Count | Accuracy | AD recall | NC recall | Macro-F1 | TP | FN | FP | TN |
+|---|---|---|---|---|---|---|---|---|---|
+| Slice | 9,000 slices | 67.4% | 0.465 | 0.879 | 0.659 | 2,076 | 2,384 | 549 | 3,991 |
+| Patient | 450 patients | 68.7% | 0.444 | 0.925 | 0.666 | 99 | 124 | 17 | 210 |
+
+Averaging gains only about 1 point of accuracy. It mostly removes slice-to-slice noise, and it can't fix a model that leans towards NC for the whole brain. Of 223 AD patients, 124 are still missed, so the bias towards NC is a patient-level problem, not a few bad slices. The missed AD patients' average `prob_AD` values are spread fairly evenly from 0 to 0.5: 26 between 0.4 and 0.5, 34 between 0.3 and 0.4, 31 between 0.2 and 0.3, and 33 below 0.2. So a lower AD threshold, chosen on the validation set, would recover some of them. About half (64 of 124) would still be missed even at 0.3, and lowering the threshold also costs NC recall, so a threshold alone won't fix the model.
+
+#### Calibration: reliability diagram and ECE
+
+A model is **calibrated** if its confidence matches how often it is right: of all the predictions made with 80% confidence, about 80% should be correct. This is the first half of the open research dilemma. If the model is calibrated, its confidence can be trusted when deciding which cases to send to a specialist.
+
+`predict.py` measures this at both the slice and the patient level (`calibration`):
+
+1. **Confidence** is the probability of the predicted class, `max(prob_AD, 1 − prob_AD)`. With 2 classes, it is always between 0.5 and 1.
+2. Predictions are sorted into **10 equal-width bins** over [0.5, 1], each 0.05 wide (`--n_bins`). For each bin, it calculates the average confidence and the accuracy.
+3. **ECE (expected calibration error)** is the gap between accuracy and confidence in each bin, weighted by how many predictions fall in that bin: ECE = Σ (nᵢ / N) · |accᵢ − confᵢ|. 0 is perfectly calibrated.
+4. **MCE (maximum calibration error)** is the largest gap in any one bin. It's sensitive to bins with only a few predictions in them.
+5. It also reports the **mean confidence on correct vs wrong predictions**. This is the second half of the dilemma: the model should be clearly less confident when it is wrong.
+
+Calibration uses the argmax prediction (0.5), regardless of `--threshold`, because it measures the probabilities themselves, not a decision rule.
+
+**Reading the diagram.** Each blue bar is a bin's accuracy. The dashed diagonal is perfect calibration. A bar **below** the diagonal means the model is **over-confident** in that bin, and the hatched area is the size of the gap. The grey histogram underneath shows how many predictions are in each bin, so you can tell which bars are based on very few predictions.
+
+![Reliability diagram, convnext_t_scratch](images/reliability_diagram_convnext_t_scratch.png)
+
+The first from-scratch run (`convnext_t_scratch`):
+
+| Level | ECE | MCE | Accuracy | Mean confidence | Confidence when correct | Confidence when wrong |
+|---|---|---|---|---|---|---|
+| Slice (9,000) | 0.125 | 0.395 | 0.674 | 0.799 | 0.819 | 0.757 |
+| Patient (450) | 0.070 | 0.952 | 0.687 | 0.755 | 0.781 | 0.698 |
+
+- **The slices are over-confident in every bin.** Average confidence is 80%, but accuracy is only 67%. The largest group, 2,776 slices at 90–95% confidence, is only 80% correct.
+- **Confidence barely separates right from wrong.** Wrong slices average 76% confidence, compared with 82% for correct ones. Even the model's mistakes are usually made with fairly high confidence, so confidence alone is a weak signal for which cases to refer. The reject curve (next) measures this directly.
+- **Label smoothing caps confidence at about 0.95.** Only 140 slices are above 0.95, and they are only 56% correct. This matches the smoothing target of 0.95 (see "Loss function").
+- **Patient-level averaging improves calibration** (ECE 0.125 → 0.070). Averaging 20 slices pulls extreme slice probabilities towards the middle, which partly cancels out the over-confidence. The patient MCE of 0.95 comes from a bin with only 2 patients, both wrong, so it isn't meaningful. With 450 patients, each bin holds only 30–70 patients, so the patient-level bars are noisy.
+
+`calibration.json` saves the per-bin counts, confidence and accuracy, so the diagram can be redrawn or compared between runs, such as smoothing 0.1 vs 0 in experiment 5.
+
+#### Reject curve (selective classification)
+
+Calibration asks whether the confidence values are *accurate* overall. The reject curve asks whether they are *useful*. If the model refers its least-confident cases to a specialist, are the cases it keeps more accurate? The acceptance criterion allows **at most 20%** of cases to be referred.
+
+`predict.py` (`reject_curve`) does this at both the slice and patient level:
+
+1. It sorts predictions by confidence, `max(prob_AD, 1 − prob_AD)`, least confident first.
+2. For each rejection rate from 0% to 50% in 1% steps, it rejects that fraction and measures **accuracy, AD recall and NC recall on the predictions that are kept**. It also records the confidence cut-off, which is the threshold a clinic would actually set, and the **fraction of all errors that were referred**.
+3. It draws 2 reference lines:
+   - **Random rejection**: referring cases at random doesn't change accuracy, so this is a flat line. The model should be above it.
+   - **Oracle**: referring the wrong predictions first, which is the best any confidence ranking could do. It reaches 100% once all errors are referred.
+4. It reports the 20% point (`--reject_rate`) and the area under the accuracy curve. The area summarises the whole curve in one number, which makes runs easy to compare: higher means a better ranking.
+
+It saves `reject_curve.json` (the full curve) and `reject_curve.png`.
+
+![Reject curve, convnext_t_scratch](images/reject_curve_convnext_t_scratch.png)
+
+The first from-scratch run (`convnext_t_scratch`), when 20% is referred:
+
+| Level | Accuracy, no rejection | Accuracy kept (20% referred) | Oracle | Confidence cut-off | Errors referred | AD recall kept | NC recall kept |
+|---|---|---|---|---|---|---|---|
+| Slice | 0.674 | 0.712 | 0.843 | 0.661 | 29% | 0.460 | 0.924 |
+| Patient | 0.687 | 0.736 | 0.858 | 0.620 | 33% | 0.438 | 0.975 |
+
+- **Confidence helps, but only a little.** Referring 20% of slices raises accuracy by 4 points (67.4% → 71.2%), against 17 points for the oracle. The referred 20% contains 29% of the errors, only slightly more than the 20% that random referral would catch.
+- **Most missed AD cases are confident mistakes.** AD recall on the kept cases doesn't improve as more are referred (0.465 → 0.460 at 20%), but NC recall does (0.879 → 0.924). Of the 1,800 slices referred, 1,178 are really AD: 613 that were missed and 565 that were correctly called AD. So the model *is* less sure about AD brains. However, the referral removes about as many correct AD predictions as missed ones. Also, only 613 of the 2,384 missed AD slices (26%) are referred, so 74% of missed AD slices are called NC *confidently* and never reach the specialist. This is the "overconfident when it is wrong" failure the open research dilemma asks about.
+- **Patients are slightly better than slices** (73.6% kept, 33% of errors referred), consistent with their better calibration.
+- **Takeaway:** for this run, the model fails the acceptance criterion's intent. Referring 20% doesn't catch most of its errors, and the most harmful errors (missed AD) are the ones it is most sure about. The experiments that should improve this are better accuracy and less overfitting (experiments 1–3), smoothing 0.1 vs 0 (experiment 5, which Xia et al. [11] link directly to weaker rejection), and post-hoc fixes such as temperature scaling or logit normalisation.
+
+#### Example predictions
+
+`predict.py` (`pick_examples`, `plot_examples`) saves `example_predictions.png`: a grid of test slices with one row per outcome. Each slice is titled with its true label, predicted label and confidence. Slices below the referral cut-off from the reject curve are marked "(referred)". Each row has at most one slice per patient, so a row never shows 4 near-identical slices of the same brain.
+
+| Row | How the slices are chosen | What it shows |
+|---|---|---|
+| Correct AD / Correct NC | Random (seeded with `--seed`), among slices confident enough *not* to be referred | Typical cases the model would decide on its own |
+| Missed AD (most confident) | The most confident false negatives | The most dangerous errors: AD called NC with high confidence |
+| False alarm (most confident) | The most confident false positives | NC brains the model is sure are AD |
+| Referred (least confident) | The least confident slices overall | What a specialist would receive |
+
+The images are the original greyscale slices from disk, before padding and normalisation. If the test images aren't at the paths stored in the CSV (e.g. on another machine), the plot is skipped and the examples are still printed.
+
+![Example predictions, convnext_t_scratch](images/example_predictions_convnext_t_scratch.png)
+
+What the first from-scratch run's examples show:
+- **The most confident mistakes are more confident than typical correct predictions.** The 4 most confident missed AD slices are all at 0.955–0.957, which is the label-smoothing ceiling. The random correct AD examples are between 0.67 and 0.88. A reject threshold can never catch these cases.
+- **The correct, wrong and referred slices look very similar** at this resolution. Nothing obvious, such as brightness, position or slice angle, separates the missed AD slices from the correct ones. Grad-CAM is needed to see what the model is actually using.
+- **Referred slices sit right at 0.50**: the model has no preference between the classes, which is the intended behaviour for an uncertain case.
+- **One test patient has a corrupted scan.** Patient `985197` (true AD) looks unlike the rest of the dataset: a different orientation with severe intensity artefacts on every slice. The model calls all 20 of its slices NC with about 95% confidence (patient `prob_AD` 0.049):
+
+  ![Patient 985197, slices 94, 100, 107 and 113](images/patient_985197_artefact.png)
+
+  This is an **out-of-distribution input**: nothing like it was seen in training, and the model still gives a confident answer instead of flagging it. Softmax confidence alone can't detect bad inputs, which matters for the open research dilemma. A deployed system would need a separate input-quality check.
+
+  This patient has since been **removed from the test set** (see "Data cleaning"), so later runs are scored on 449 test patients.
 
 -----------------------------------------------------
 
@@ -702,13 +863,27 @@ Dataset: ADNI dataset
 
 The ADNI dataset provides structural MRI scans that can be preprocessed to include only the Alzheimer's disease and Cognitively Normal classes, accessible via the ADNI portal [3]. The full ADNI cohort has 591 subjects with Alzheimer's disease and 1479 cognitively normal subjects, with approximately a 50/50 split in sex and a varied age split.
 
-The course subset used in this project contains 1,526 patients (743 AD, 783 CN). The data will be split into 3 sets, with each patient's data confined to a single split to avoid data leakage:
+The course subset used in this project contains 1,526 patients (743 AD, 783 CN). One corrupted AD scan was later removed from the test set (see "Data cleaning"), leaving 1,525 (742 AD, 783 CN). The data is split into 3 sets, with each patient's data confined to a single split to avoid data leakage:
 
 | Split | AD slices | NC slices | AD patients | NC patients |
 |-------|----------:|----------:|------------:|------------:|
 | Train | 8,840 | 9,460 | 442 | 473 |
 | Validate (15% of the original train set, by patient) | 1,560 | 1,660 | 78 | 83 |
-| Test | 4,460 | 4,540 | 223 | 227 |
+| Test (after data cleaning) | 4,440 | 4,540 | 222 | 227 |
+| *Test (original, used by the first runs)* | *4,460* | *4,540* | *223* | *227* |
+
+Every patient has exactly 20 slices, and every image is 256×240 greyscale. `testscripts/check_data.py` confirms this, and also confirms that no patient appears in more than one split.
+
+#### Data cleaning
+
+One test patient, `985197` (AD, 20 slices), was **removed from the test set**. Every slice of this scan is corrupted: it is in a different orientation from the rest of the dataset, and it has severe intensity artefacts (see "Example predictions"). It isn't a valid T1-weighted sagittal brain slice, so neither a model nor a clinician could diagnose AD from it.
+
+How it was found, and what that means for the results:
+- It was found by looking at the first from-scratch run's most confident errors on the **test** set, where the model called all 20 slices NC with about 95% confidence. Ideally, data problems are found *before* looking at test results, for example by checking every split for outliers. Removing a test case after seeing the model's mistake on it is a mild form of tuning on the test set, so it is reported here.
+- The effect is small: 20 of 9,000 slices (0.2%) and 1 of 450 patients. Removing one confidently missed AD patient slightly raises test accuracy and AD recall, and slightly improves calibration.
+- **The first from-scratch run (`convnext_t_scratch`) and the pretrained smoke test used the original test set** (9,000 slices, 450 patients). Their numbers in this README are not exactly comparable with later runs, which use the cleaned set (8,980 slices, 449 patients).
+- Only the test set was checked by eye. Train and validation may contain similar scans: a systematic outlier check of every split is listed as experiment 9 in `future_experiments.txt`.
+- The case is still a useful finding for the open research dilemma: the model gave a confident wrong answer on an input unlike anything in training, instead of flagging it.
 
 ### Course Concepts
 Key course concepts that will help in building this model include:

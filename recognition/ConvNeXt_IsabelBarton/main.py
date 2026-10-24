@@ -101,14 +101,17 @@ def get_args_parser():
                         help='num of steps to warmup LR, will overload warmup_epochs if set > 0')
 
     # Augmentation parameters
-    parser.add_argument('--aa', type=str, default='',
-                        help='Use AutoAugment policy, e.g. "rand-m9-mstd0.5-inc1". (default: "" = off)')
-    parser.add_argument('--color_jitter', type=float, default=0, metavar='PCT',
-                        help='Color jitter factor (default: 0 = off)')
+    # small random affine only (no RandomResizedCrop / flip / RandAugment): see normalise.build_transform
+    parser.add_argument('--affine_degrees', type=float, default=10,
+                        help='Random rotation range in degrees, +-value (default: 10)')
+    parser.add_argument('--affine_translate', type=float, default=0.05,
+                        help='Random shift as a fraction of image size, +-value (default: 0.05)')
+    parser.add_argument('--affine_scale', type=float, default=0.05,
+                        help='Random zoom range, 1 +- value (default: 0.05)')
     parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
-    parser.add_argument('--train_interpolation', type=str, default='bilinear',
-                        help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
+    parser.add_argument('--train_interpolation', type=str, default='bilinear', choices=['bilinear', 'bicubic', 'nearest'],
+                        help='Interpolation for the training resize / affine (default: bilinear)')
 
     # Evaluation parameters
     parser.add_argument('--crop_pct', type=float, default=None)
@@ -189,7 +192,7 @@ def main(args):
     # training always uses AMP (autocast/GradScaler on 'cuda'), so it needs a CUDA GPU
     if device.type != 'cuda' or not torch.cuda.is_available():
         raise SystemExit("main.py needs a CUDA GPU (training always uses mixed precision); "
-                         "use predict.py to evaluate a trained model on a CPU")
+                         "use predict.py --resume <checkpoint> to evaluate a trained model on a CPU")
 
     # fix the seed for reproducibility
     torch.manual_seed(args.seed)
@@ -345,17 +348,22 @@ def main(args):
             lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
             num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
         )
+        
+        # save results of epoch
         if args.output_dir and args.save_ckpt:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
                 utils.save_model(
                     args=args, model=model, optimizer=optimizer,
                     loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
+        
+        # run validation after each epoch
         if data_loader_val is not None:
             val_stats = evaluate(data_loader_val, model, device, use_amp=True, header='Val:')
             print(f"Accuracy of the model on the {len(dataset_val)} validation images: {val_stats['acc1']:.1f}%")
             if max_accuracy < val_stats["acc1"]:
                 max_accuracy = val_stats["acc1"]
                 if args.output_dir and args.save_ckpt:
+                    # save the latest updated weights
                     utils.save_model(
                         args=args, model=model, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
@@ -398,7 +406,7 @@ def main(args):
             with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    total_time = time.time() - start_time
+    total_time = time.time() - start_time # final epoch time 
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
