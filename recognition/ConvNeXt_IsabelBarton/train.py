@@ -5,54 +5,60 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Training (AdamW, one epoch), evaluation and the AD/NC classification metrics.
 
 import math # math.isfinite: checks the loss isn't inf/NaN
-from typing import Iterable, Optional # type hints only (documentation, no effect when running)
 import torch
-from timm.utils import accuracy, ModelEma # accuracy: % correct (used in evaluate); ModelEma: the EMA copy's type
+from timm.utils import accuracy # % correct (used in evaluate)
 
-import utils # MetricLogger, SmoothedValue (logging helpers)
+import utils # MetricLogger (logging), NativeScalerWithGradNormCount (AMP)
 
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, loss_scaler, max_norm: Optional[float] = None,
-                    model_ema: Optional[ModelEma] = None, log_writer=None,
-                    start_steps=None, lr_schedule_values=None, wd_schedule_values=None,
-                    num_training_steps_per_epoch=None, update_freq=None):
+
+def get_parameter_groups(model, weight_decay):
+    """Split the weights into 2 groups so weight decay only applies to the ones it should."""
+    decay, no_decay = [], []
+    for name, param in model.named_parameters(): # every learnable tensor, e.g. "stages.0.0.dwconv.weight"
+        # 1-D params (biases, norm weights, layer scale gamma) get no weight decay; only conv/linear weights are decayed.
+        # decay pulls weights towards 0, which would undo norm scales (start at 1) and gamma, and biases don't overfit
+        (no_decay if len(param.shape) == 1 or name.endswith(".bias") else decay).append(param)
+    print(f"Param groups: {len(decay)} tensors with weight decay {weight_decay}, {len(no_decay)} without")
+    return [{"weight_decay": weight_decay, "params": decay}, {"weight_decay": 0., "params": no_decay}]
+
+
+def create_optimizer(args, model):
+    # AdamW (the optimiser ConvNeXt was designed and tuned with): adaptive step size per weight + weight decay applied
+    # separately from the gradient (the "W"). Weight decay is set per group above, so AdamW's own stays 0.
+    # lr here is only the starting value; train_one_epoch sets it every step from the warmup + cosine schedule
+    return torch.optim.AdamW(get_parameter_groups(model, args.weight_decay), lr=args.lr, weight_decay=0.)
+
+
+def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, loss_scaler,
+                    start_steps, lr_schedule_values, num_training_steps_per_epoch):
     # trains the model for one pass over the training set; called once per epoch from main.py
     # always uses AMP (mixed precision), so training needs a CUDA GPU
-    model.train(True) # training mode: DropPath randomly skips blocks (switched off by model.eval() in evaluate)
+    model.train(True) # training mode: DropPath/dropout on, BatchNorm uses batch statistics (model.eval() in evaluate)
     # running averages of loss/acc etc., printed every 10 batches to train.log
     metric_logger = utils.MetricLogger(delimiter="  ")
     # window_size=1: show the current lr, not an average
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    metric_logger.add_meter('min_lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    optimizer.zero_grad() # PyTorch adds gradients to the existing ones, so clear them before the first batch
-
     # one batch per loop: samples (64, 3, 256, 256), targets (64,) with 0 = AD, 1 = NC
     # log_every times each batch and prints a progress line every 10 batches
-    for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        step = data_iter_step // update_freq # optimizer step within this epoch (= batch number when update_freq is 1)
-        if step >= num_training_steps_per_epoch: # safety: skip leftover batches past the schedule (never triggers with 64 x 1)
+    for step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        if step >= num_training_steps_per_epoch: # safety: never step past the end of the lr schedule
             continue
-        it = start_steps + step  # global training iteration, e.g. epoch 3 batch 10 -> 3 x 285 + 10 = 865 (position in the schedules)
-        # set this step's lr and weight decay from the schedules, on the first batch of each accumulated step
-        if (lr_schedule_values is not None or wd_schedule_values is not None) and data_iter_step % update_freq == 0:
-            for i, param_group in enumerate(optimizer.param_groups): # decay and no_decay groups
-                if lr_schedule_values is not None:
-                    param_group["lr"] = lr_schedule_values[it] * param_group["lr_scale"] # lr_scale is always 1
-                if wd_schedule_values is not None and param_group["weight_decay"] > 0: # no_decay group stays at 0
-                    param_group["weight_decay"] = wd_schedule_values[it]
+        it = start_steps + step  # global training iteration, e.g. epoch 3 batch 10 -> 3 x 285 + 10 = 865
+        for param_group in optimizer.param_groups: # decay and no_decay groups
+            param_group["lr"] = lr_schedule_values[it] # this step's lr from the warmup + cosine schedule
 
-        # copy the batch from CPU to GPU; non_blocking + pinned memory (--pin_mem) overlap the copy with GPU work
+        # copy the batch from CPU to GPU; non_blocking + pinned memory overlap the copy with GPU work
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
 
         # forward pass: output = logits (64, 2), raw scores for AD and NC (softmax turns them into probabilities)
-        # autocast: float16 for convs/matmuls (fast), float32 for softmax/LayerNorm/loss; weights stay float32
+        # autocast: float16 for convs/matmuls (fast), float32 for softmax/norms/loss; weights stay float32
         with torch.amp.autocast('cuda'):
             output = model(samples)
             loss = criterion(output, targets) # label-smoothing cross-entropy, averaged over the batch
@@ -64,17 +70,9 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             print("Loss is {}, stopping training".format(loss_value))
             assert math.isfinite(loss_value)
 
-        # backward pass + weight update (one optimizer step every update_freq batches; every batch when it's 1)
-        loss /= update_freq # accumulation: summed grads of update_freq batches = grad of their average loss (no-op at 1)
-        # loss_scaler: scaled backward() (chain rule gives every weight's gradient, added into .grad), then on the
-        # last batch of the group: unscale, measure/clip grad norm, AdamW step (skipped if inf/NaN), adjust scale
-        grad_norm = loss_scaler(loss, optimizer, clip_grad=max_norm,
-                                parameters=model.parameters(),
-                                update_grad=(data_iter_step + 1) % update_freq == 0)
-        if (data_iter_step + 1) % update_freq == 0:
-            optimizer.zero_grad() # clear grads after the step; NOT between accumulated batches, so those add up
-            if model_ema is not None:
-                model_ema.update(model) # EMA copy moves slightly towards the new weights
+        # backward pass + AdamW step through the AMP loss scaler (see utils.NativeScalerWithGradNormCount)
+        grad_norm = loss_scaler(loss, optimizer, parameters=model.parameters())
+        optimizer.zero_grad() # PyTorch adds gradients to the existing ones, so clear them for the next batch
 
         # wait for the GPU to finish this batch, so log_every's timings are correct
         torch.cuda.synchronize()
@@ -82,37 +80,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # training accuracy of this batch: argmax of the logits = predicted class (0 = AD, 1 = NC)
         # lower than eval accuracy on the same images: DropPath + augmentation are on, and weights change during the epoch
         class_acc = (output.max(-1)[-1] == targets).float().mean()
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(class_acc=class_acc)
-        # smallest/largest lr across the param groups; equal here as both groups use lr_scale 1
-        # (leftover from layer-wise lr decay in the original repo; not the same as --min_lr)
-        min_lr = 10.
-        max_lr = 0.
-        for group in optimizer.param_groups:
-            min_lr = min(min_lr, group["lr"])
-            max_lr = max(max_lr, group["lr"])
-
-        metric_logger.update(lr=max_lr)
-        metric_logger.update(min_lr=min_lr)
-        weight_decay_value = None # weight decay of the decay group (no_decay group is 0)
-        for group in optimizer.param_groups:
-            if group["weight_decay"] > 0:
-                weight_decay_value = group["weight_decay"]
-        metric_logger.update(weight_decay=weight_decay_value)
-        metric_logger.update(grad_norm=grad_norm) # None (skipped) on accumulated batches that don't take a step
-
-        # per-step values to TensorBoard (if --log_dir is set)
-        if log_writer is not None:
-            log_writer.update(loss=loss_value, head="loss")
-            log_writer.update(class_acc=class_acc, head="loss")
-            log_writer.update(lr=max_lr, head="opt")
-            log_writer.update(min_lr=min_lr, head="opt")
-            log_writer.update(weight_decay=weight_decay_value, head="opt")
-            log_writer.update(grad_norm=grad_norm, head="opt")
-            log_writer.set_step()
+        metric_logger.update(loss=loss_value, class_acc=class_acc, lr=optimizer.param_groups[0]["lr"],
+                             grad_norm=grad_norm)
 
     print("Averaged stats:", metric_logger)
-    # epoch averages; main.py writes them to log.txt as train_loss, train_class_acc, ... (used by plot_log.py)
+    # epoch averages; main.py writes them to log.txt as train_loss, train_class_acc, train_lr, ... (used by plot_log.py)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad() # no gradient tracking: less memory and faster, as nothing is learned here

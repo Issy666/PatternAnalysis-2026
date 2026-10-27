@@ -35,7 +35,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from predict import patient_id
+from dataset import build_dataset, patient_id
+from utils import load_trained_model
 
 BLUE, ORANGE, INK, MUTED, GREY = '#2a78d6', '#eb6834', '#0b0b0b', '#898781', '#c9c8c3'
 
@@ -59,19 +60,6 @@ def get_args_parser():
 # ---------------------------------------------------------------------------
 # Model, data and scan-level outcomes
 # ---------------------------------------------------------------------------
-
-def load_model_and_test(checkpoint_path, device):
-    from main import build_model
-    from dataset import build_dataset
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    train_args = checkpoint['args']
-    train_args.nb_classes = 2
-    dataset, _ = build_dataset(split='test', args=train_args)
-    model = build_model(train_args)
-    model.load_state_dict(checkpoint['model'])
-    model.to(device).eval()
-    return model, dataset, train_args
-
 
 def scan_outcomes(run_dir):
     """{scan id: dict(label, prob_AD, pred, referred)} plus a description of where it came from."""
@@ -274,8 +262,7 @@ def slice_features(model, dataset, args):
     feats = []
     for x, _ in loader:
         x = x.to(args.device)
-        f = model.forward_features(x) if hasattr(model, 'forward_features') else model.features(x).mean([-2, -1])
-        feats.append(f.float().cpu())
+        feats.append(model.forward_features(x).float().cpu())
     return torch.cat(feats).numpy()
 
 
@@ -360,9 +347,10 @@ def main(args):
     out = Path(args.output_dir) if args.output_dir else run_dir / 'visualise'
     out.mkdir(parents=True, exist_ok=True)
 
-    model, dataset, train_args = load_model_and_test(args.resume, args.device)
+    model, train_args = load_trained_model(args.resume, args.device) # rebuilt from the checkpoint's saved arguments
+    dataset = build_dataset(split='test', args=train_args)
     outcomes, source = scan_outcomes(run_dir)
-    print(f"Model {train_args.model} from {args.resume}; outcomes from {source}")
+    print(f"Outcomes from {source}")
     middles = middle_slices(dataset)
     missing = set(middles) - set(outcomes)
     if missing:

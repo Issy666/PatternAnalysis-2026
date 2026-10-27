@@ -15,6 +15,7 @@ from collections import defaultdict
 
 import torch
 
+from dataset import patient_id
 from train import evaluate, binary_metrics
 
 CLASSES = ['AD', 'NC'] # ImageFolder numbers folders alphabetically, so AD = 0 (positive class), NC = 1
@@ -55,11 +56,6 @@ def load_predictions(csv_path):
     """Read test_predictions.csv into a list of (path, label, prob_AD) per slice."""
     with open(csv_path, newline='') as f:
         return [(row['path'], row['label'], float(row['prob_AD'])) for row in csv.DictReader(f)]
-
-
-def patient_id(path):
-    # filenames are <patientID>_<sliceID>.jpeg, e.g. 1003730_100.jpeg -> 1003730
-    return os.path.basename(path).split('_')[0]
 
 
 def patient_predictions(slices, threshold=0.5):
@@ -509,12 +505,13 @@ def plot_examples(examples, cutoff, path):
 # ---------------------------------------------------------------------------
 
 def get_args_parser():
-    # reuse main.py's arguments (model, data paths, input size, batch size...) so the model and test
-    # transforms are built exactly as in training; imported here, not at the top, because main.py imports run_test
-    from main import get_args_parser as main_args_parser
-    parser = argparse.ArgumentParser('ConvNeXt test + analysis script', parents=[main_args_parser()])
+    parser = argparse.ArgumentParser('ConvNeXt test + analysis script')
+    parser.add_argument('--resume', default='', type=str,
+                        help='checkpoint to run on its test set (model and data are rebuilt from its saved arguments)')
     parser.add_argument('--predictions', default='', type=str,
                         help='existing test_predictions.csv to analyse (skips running the model)')
+    parser.add_argument('--output_dir', default=None, type=str,
+                        help="default: the CSV's folder, or <run>/predict for --resume")
     parser.add_argument('--threshold', default=0.5, type=float,
                         help='predict AD when the patient-average prob_AD is above this (default: 0.5)')
     parser.add_argument('--n_bins', default=10, type=int,
@@ -522,9 +519,10 @@ def get_args_parser():
     parser.add_argument('--reject_rate', default=0.2, type=float,
                         help='fraction of least-confident cases referred to a specialist, reported from the '
                              'reject curve (default: 0.2, the acceptance criterion\'s limit)')
-    # output_dir defaults to the checkpoint's / CSV's folder (see main below) instead of main.py's results root;
-    # device falls back to the CPU, which main.py does not allow
-    parser.set_defaults(output_dir=None, device='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--seed', default=0, type=int, help='seed for picking the example predictions')
+    parser.add_argument('--batch_size', default=96, type=int)
+    parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     return parser
 
 
@@ -534,26 +532,22 @@ def main(args):
         csv_path = args.predictions
         output_dir = args.output_dir or os.path.dirname(os.path.abspath(csv_path))
     else:
-        # mode 1: load the checkpoint, run it on the test set and write test_predictions.csv
+        # mode 1: load the checkpoint, run it on its test set and write test_predictions.csv
         if not args.resume:
             raise SystemExit("Give either --resume <checkpoint.pth> or --predictions <test_predictions.csv>")
-        from main import build_model
         from dataset import build_dataset
+        from utils import load_trained_model
 
         # separate subfolder so the training run's own test_results.json / test_predictions.csv aren't overwritten
         args.output_dir = args.output_dir or os.path.join(os.path.dirname(os.path.abspath(args.resume)), 'predict')
         os.makedirs(args.output_dir, exist_ok=True)
         output_dir = args.output_dir
 
-        dataset_test, args.nb_classes = build_dataset(split='test', args=args)
+        model, train_args = load_trained_model(args.resume, args.device)
+        dataset_test = build_dataset(split='test', args=train_args)
         data_loader_test = torch.utils.data.DataLoader(
             dataset_test, shuffle=False, # in order, so predictions line up with dataset_test.samples
-            batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_mem)
-
-        model = build_model(args)
-        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
-        model.load_state_dict(checkpoint['model'])
-        model.to(args.device)
+            batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True)
         run_test(model, data_loader_test, dataset_test, args.device, args, checkpoint_name=args.resume)
         csv_path = os.path.join(output_dir, 'test_predictions.csv')
 

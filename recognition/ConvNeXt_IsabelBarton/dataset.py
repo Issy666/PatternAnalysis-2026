@@ -1,11 +1,7 @@
-
-import os
-from collections import defaultdict
-from PIL import Image
-from torchvision import datasets, transforms
-import normalise
-
 """
+ADNI datasets: train / validation / test folders of <scanID>_<slice>.jpeg slices in AD/ and NC/ class folders.
+
+References:
 https://github.com/facebookresearch/ConvNeXt/blob/main/main.py
 https://github.com/MeetRVyas/adni_code/tree/main/docs/assets
 https://github.com/hunghuynh1110/Alzheimers-MRI-ConvNext/blob/main/dataset.py
@@ -16,9 +12,19 @@ https://link.springer.com/chapter/10.1007/978-3-031-14903-0_48
 https://www.biorxiv.org/content/10.1101/2025.07.10.664260v1.full
 https://www.mdpi.com/2075-4418/15/23/2997#Data_Availability_Statement
 https://zenodo.org/records/17084199
-
-
 """
+import os
+from collections import defaultdict
+from PIL import Image
+from torchvision import datasets
+import normalise
+
+
+def patient_id(path):
+    # filenames are <scanID>_<sliceID>.jpeg, e.g. 1003730_100.jpeg -> 1003730. The ID is one scan session (ADNI image ID);
+    # the code calls it a "patient", but one person scanned at several visits has several IDs (see subject_datasplit.py)
+    return os.path.basename(path).split('_')[0]
+
 
 class NeighbourSliceFolder(datasets.ImageFolder):
     """
@@ -60,35 +66,15 @@ class NeighbourSliceFolder(datasets.ImageFolder):
         return img, target
 
 
-def get_stats(args):
-    # mean/std always come from the training split only, so val/test never leak into normalisation
-    if args.data_set == 'ADNI':
-        train_paths = [path for path, _ in datasets.ImageFolder(args.data_path).samples]
-        return normalise.compute_stats(train_paths, args.data_set, cache_dir=args.stats_dir,
-                                       target_size=args.input_size)
-    return normalise.load_stats(args.data_set, cache_dir=args.stats_dir)
-
-
 def build_dataset(split, args):
-    # split is one of 'train', 'val' or 'test'
-    is_train = split == 'train'
-    stats = get_stats(args)
-    transform = normalise.build_transform(is_train, stats, img_size=args.input_size, args=args)
+    """split is 'train', 'val' or 'test'. Classes are numbered alphabetically by ImageFolder: AD = 0, NC = 1."""
+    # mean/std always come from the training split only, so val/test never leak into normalisation
+    train_paths = [path for path, _ in datasets.ImageFolder(args.data_path).samples]
+    stats = normalise.compute_stats(train_paths, 'ADNI', target_size=args.input_size)
+    transform = normalise.build_transform(split == 'train', stats, img_size=args.input_size, args=args)
 
-    if args.data_set == 'ADNI':
-        data_dir = {'train': args.data_path,
-                    'val': args.val_data_path,
-                    'test': args.eval_data_path}[split]
-        if getattr(args, 'neighbour_slices', False):
-            dataset = NeighbourSliceFolder(data_dir, transform=transform, step=args.neighbour_step)
-        else:
-            dataset = datasets.ImageFolder(data_dir, transform=transform)
-        nb_classes = 2
-    elif args.data_set == 'CIFAR':
-        dataset = datasets.CIFAR100(args.data_path, train=is_train, transform=transform, download=True)
-        nb_classes = 100
-    else:
-        raise NotImplementedError()
-    print("Number of the class = %d" % nb_classes)
-
-    return dataset, nb_classes
+    data_dir = {'train': args.data_path, 'val': args.val_data_path, 'test': args.eval_data_path}[split]
+    # getattr: checkpoints saved before 2.5D input existed don't have --neighbour_slices
+    if getattr(args, 'neighbour_slices', False):
+        return NeighbourSliceFolder(data_dir, transform=transform, step=args.neighbour_step)
+    return datasets.ImageFolder(data_dir, transform=transform)

@@ -30,7 +30,8 @@ from collections import defaultdict
 import numpy as np
 import torch
 
-from predict import CLASSES, calibration, classification_metrics, patient_id, plot_reliability, print_calibration
+from dataset import patient_id
+from predict import calibration, classification_metrics, plot_reliability, print_calibration
 
 EPS = 1e-6  # predictions are stored with 6 decimals, so P(AD) is clamped to [1e-6, 1 - 1e-6] before taking logits
 
@@ -64,21 +65,15 @@ def get_args_parser():
 
 def predict_validation(checkpoint_path, out_csv, args):
     """Run the checkpoint on its own validation set and write val_predictions.csv (same columns as test)."""
-    from main import build_model
     from dataset import build_dataset
     from train import evaluate
+    from utils import load_trained_model
 
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-    train_args = checkpoint['args'] # the exact arguments the model was trained with
-    train_args.nb_classes = 2
-    dataset_val, _ = build_dataset(split='val', args=train_args)
+    model, train_args = load_trained_model(checkpoint_path, args.device) # rebuilt from the checkpoint's saved arguments
+    dataset_val = build_dataset(split='val', args=train_args)
     loader = torch.utils.data.DataLoader(dataset_val, shuffle=False, batch_size=args.batch_size,
                                          num_workers=args.num_workers, pin_memory=True)
-    model = build_model(train_args)
-    model.load_state_dict(checkpoint['model'])
-    model.to(args.device)
-    print(f"Running {checkpoint_path} (epoch {checkpoint['epoch']}) on {len(dataset_val)} validation slices "
-          f"from {train_args.val_data_path}")
+    print(f"Running it on {len(dataset_val)} validation slices from {train_args.val_data_path}")
     _, probs, targets = evaluate(loader, model, args.device, use_amp=torch.device(args.device).type == 'cuda',
                                  header='Val:', return_preds=True)
 
