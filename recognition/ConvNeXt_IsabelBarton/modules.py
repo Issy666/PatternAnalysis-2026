@@ -178,8 +178,126 @@ class LayerNorm(nn.Module):
             return x
 
 
+class BlockBN(nn.Module):
+    r""" ConvNeXt Block with BatchNorm instead of LayerNorm, kept in (N, C, H, W) the whole way:
+    DwConv -> BatchNorm2d -> 1x1 Conv -> GELU -> 1x1 Conv -> layer scale -> DropPath -> residual
+    (implementation (1) from Block above, with BN in place of channels_first LN)
+
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+    """
+    def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # same 7x7 depthwise conv as Block
+
+        # BN normalises each channel over the batch and H, W (LN normalises over the channels at each pixel);
+        # running mean/var are learnt during training and used at eval, so test images don't affect each other
+        self.norm = nn.BatchNorm2d(dim)
+
+        # 1x1 convs = the same per-pixel channel MLP as Block's nn.Linear, but without permuting to channels_last
+        self.pwconv1 = nn.Conv2d(dim, 4 * dim, kernel_size=1)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Conv2d(4 * dim, dim, kernel_size=1)
+
+        # (C, 1, 1) so it broadcasts over H, W in channels_first
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim, 1, 1)),
+                                    requires_grad=True) if layer_scale_init_value > 0 else None
+
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+
+    def forward(self, x):
+        input = x
+        x = self.dwconv(x)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = input + self.drop_path(x)
+        return x
+
+class ConvNeXtBN(nn.Module):
+    r""" ConvNeXt with every LayerNorm swapped for BatchNorm, and dropout before the classifier.
+        Alternative to ConvNeXt for training from scratch on the small ADNI dataset: the LN model sat at ~50%
+        validation for the first ~16 epochs of convnext_t_scratch, and the BN-based reference repo
+        (hunghuynh1110/Alzheimers-MRI-ConvNext) reports BN trained better for them.
+
+    Args:
+        same as ConvNeXt, plus
+        head_drop_rate (float): Dropout on the pooled features before the head. Default: 0.4 (as in the reference repo)
+    """
+    def __init__(self, in_chans=3, num_classes=1000,
+                 depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.1,
+                 layer_scale_init_value=1e-6, head_drop_rate=0.4,
+                 ):
+
+        super().__init__()
+
+        self.downsample_layers = nn.ModuleList()
+
+        # stem: same 4x4 patchify, BN in place of LN, (N, 3, 256, 256) -> (N, 96, 64, 64)
+        stem = nn.Sequential(
+            nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
+            nn.BatchNorm2d(dims[0])
+        )
+        self.downsample_layers.append(stem)
+
+        # BN before each 2x2 stride-2 downsampling conv, as LN is in ConvNeXt
+        for i in range(3):
+            downsample_layer = nn.Sequential(
+                    nn.BatchNorm2d(dims[i]),
+                    nn.Conv2d(dims[i], dims[i+1], kernel_size=2, stride=2),
+            )
+            self.downsample_layers.append(downsample_layer)
+
+        self.stages = nn.ModuleList()
+        dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        cur = 0
+        for i in range(4):
+            stage = nn.Sequential(
+                *[BlockBN(dim=dims[i], drop_path=dp_rates[cur + j],
+                layer_scale_init_value=layer_scale_init_value) for j in range(depths[i])]
+            )
+            self.stages.append(stage)
+            cur += depths[i]
+
+        # pooled (N, 768) -> BatchNorm1d -> Dropout -> Linear
+        # dropout zeros a random 40% of the 768 features for each training image, so the head can't rely on a few of them
+        self.norm = nn.BatchNorm1d(dims[-1])
+        self.head_drop = nn.Dropout(head_drop_rate)
+        self.head = nn.Linear(dims[-1], num_classes)
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        # same as ConvNeXt; BatchNorms keep PyTorch's defaults (weight 1, bias 0)
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            nn.init.constant_(m.bias, 0)
+
+    def forward_features(self, x):
+        for i in range(4):
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
+        return self.norm(x.mean([-2, -1])) # global average pooling, (N, C, H, W) -> (N, C)
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head_drop(x) # only active in model.train(); model.eval() turns it off
+        x = self.head(x)
+        return x
+
+
 def convnext_tiny(**kwargs): #kwargs is the dictionary of initial arguments
 
-    model = ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs) #depths = how many ConvNeXt blocks each of the 4 stages, dims =  how many channels (feature maps) each stage has. 
+    model = ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs) #depths = how many ConvNeXt blocks each of the 4 stages, dims =  how many channels (feature maps) each stage has.
+    return model
+
+def convnext_tiny_bn(**kwargs):
+
+    model = ConvNeXtBN(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs) # same size as convnext_tiny, BN + head dropout
     return model
 

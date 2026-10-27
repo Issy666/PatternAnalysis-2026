@@ -17,7 +17,7 @@ from timm.utils import ModelEma
 from dataset import build_dataset
 from optim_factory import create_optimizer
 from train import train_one_epoch, evaluate
-from predict import run_test
+from predict import run_test, patient_predictions, classification_metrics
 from utils import NativeScalerWithGradNormCount as NativeScaler
 import modules
 import normalise
@@ -57,6 +57,9 @@ def get_args_parser():
 
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help='Initial value of the per-channel layer scale (gamma); 0 disables it (default: 1e-6)')
+
+    parser.add_argument('--head_drop', type=float, default=0.4,
+                        help='Dropout before the classifier, convnext_tiny_bn only (default: 0.4)')
 
     # EMA related parameters (off by default)
     parser.add_argument('--model_ema', type=str2bool, default=False,
@@ -108,6 +111,10 @@ def get_args_parser():
                         help='Random shift as a fraction of image size, +-value (default: 0.05)')
     parser.add_argument('--affine_scale', type=float, default=0.05,
                         help='Random zoom range, 1 +- value (default: 0.05)')
+    parser.add_argument('--brightness', type=float, default=0.0,
+                        help='Random brightness factor range, 1 +- value (default: 0, off)')
+    parser.add_argument('--contrast', type=float, default=0.0,
+                        help='Random contrast factor range, 1 +- value (default: 0, off)')
     parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
     parser.add_argument('--train_interpolation', type=str, default='bilinear', choices=['bilinear', 'bicubic', 'nearest'],
@@ -166,18 +173,32 @@ def get_args_parser():
                         help='Perform evaluation only')
     parser.add_argument('--disable_eval', type=str2bool, default=False,
                         help='Disabling evaluation during training')
+    # which validation score picks checkpoint-best.pth. slice accuracy hides the AD/NC split of errors and jumps
+    # around by luck; patient macro-F1 weights AD and NC equally, ties go to the lower validation loss
+    parser.add_argument('--best_metric', default='acc1', choices=['acc1', 'patient_macro_f1'],
+                        help='Validation metric used to choose checkpoint-best.pth (default: acc1)')
 
     return parser
 
 def build_model(args):
     # models are built straight from modules.py and trained from scratch (random initial weights)
     if not hasattr(modules, args.model):
-        raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: convnext_tiny")
-    return getattr(modules, args.model)(
+        raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: convnext_tiny, convnext_tiny_bn")
+    kwargs = dict(
         num_classes=args.nb_classes,
         drop_path_rate=args.drop_path, # reduce overfitting by dropping blocks in the model
         layer_scale_init_value=args.layer_scale_init_value, #add a scalar to each block per channel to deterine the influence of each blocks
     )
+    if args.model.endswith('_bn'):
+        kwargs['head_drop_rate'] = args.head_drop # only the BN model has head dropout
+    return getattr(modules, args.model)(**kwargs)
+
+
+def val_patient_metrics(dataset, probs):
+    # probs are in dataset.samples order (val loader isn't shuffled); column 0 = P(AD)
+    idx_to_class = {v: k for k, v in dataset.class_to_idx.items()}
+    slices = [(path, idx_to_class[target], p[0]) for (path, target), p in zip(dataset.samples, probs.tolist())]
+    return classification_metrics(patient_predictions(slices))
 
 
 
@@ -331,6 +352,7 @@ def main(args):
         return
 
     max_accuracy = 0.0 #accuracy counter
+    best_score, best_epoch = None, None # (best_metric, -val loss) of checkpoint-best.pth, compared as a tuple
     if args.model_ema and args.model_ema_eval:
         max_accuracy_ema = 0.0 #ema accuracy counter
 
@@ -358,16 +380,24 @@ def main(args):
         
         # run validation after each epoch
         if data_loader_val is not None:
-            val_stats = evaluate(data_loader_val, model, device, use_amp=True, header='Val:')
+            val_stats, val_probs, _ = evaluate(data_loader_val, model, device, use_amp=True, header='Val:',
+                                               return_preds=True)
             print(f"Accuracy of the model on the {len(dataset_val)} validation images: {val_stats['acc1']:.1f}%")
-            if max_accuracy < val_stats["acc1"]:
-                max_accuracy = val_stats["acc1"]
+            # patient level: average each patient's 20 slice probabilities, as predict.py does for test
+            val_stats.update({f'patient_{k}': v for k, v in val_patient_metrics(dataset_val, val_probs).items()})
+            print(f"Patient-level validation: accuracy {val_stats['patient_acc1']:.1f}%  "
+                  f"AD recall {val_stats['patient_ad_recall']:.3f}  macro-F1 {val_stats['patient_macro_f1']:.3f}")
+            max_accuracy = max(max_accuracy, val_stats["acc1"])
+            score = (val_stats[args.best_metric], -val_stats['loss'])
+            if best_score is None or score > best_score:
+                best_score, best_epoch = score, epoch
                 if args.output_dir and args.save_ckpt:
                     # save the latest updated weights
                     utils.save_model(
                         args=args, model=model, optimizer=optimizer,
                         loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
-            print(f'Max validation accuracy: {max_accuracy:.2f}%')
+            print(f'Max validation accuracy: {max_accuracy:.2f}%  '
+                  f'best {args.best_metric}: {best_score[0]:.4f} (epoch {best_epoch})')
 
             if log_writer is not None:
                 log_writer.update(val_acc1=val_stats['acc1'], head="perf", step=epoch)
@@ -419,6 +449,9 @@ def main(args):
         checkpoint_name = str(best_path)
     extra = {
         'best_val_acc1': max_accuracy,
+        'best_metric': args.best_metric,
+        'best_val_score': best_score[0] if best_score else None,
+        'best_epoch': best_epoch,
         'epochs_trained_this_run': args.epochs - args.start_epoch,
         'training_time_this_run': total_time_str,
         'max_gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 ** 2 if torch.cuda.is_available() else None,

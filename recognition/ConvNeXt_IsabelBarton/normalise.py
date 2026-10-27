@@ -193,6 +193,9 @@ def build_transform(is_train,
                 fill=0,                                                    # new corners are black, like the background
             ),
             # no horizontal flip: every sagittal slice faces the same way, and a mirrored brain never appears at test
+            # random brightness/contrast (intensity) mimics scanner and acquisition differences between patients;
+            # 0 (the default) = no change. Brightness scales pixels, so the black background stays black
+            transforms.ColorJitter(brightness=args.brightness, contrast=args.contrast),
             transforms.ToTensor(),
             transforms.Normalize(mean=stats["mean"], std=stats["std"]),
             # erase one random rectangle (filled with random noise) in 25% of images, after normalisation as in timm
