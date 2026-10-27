@@ -59,7 +59,7 @@ def get_args_parser():
                         help='Initial value of the per-channel layer scale (gamma); 0 disables it (default: 1e-6)')
 
     parser.add_argument('--head_drop', type=float, default=0.4,
-                        help='Dropout before the classifier, convnext_tiny_bn only (default: 0.4)')
+                        help='Dropout before the classifier, BatchNorm (*_bn) models only (default: 0.4)')
 
     # EMA related parameters (off by default)
     parser.add_argument('--model_ema', type=str2bool, default=False,
@@ -139,6 +139,12 @@ def get_args_parser():
     parser.add_argument('--eval_data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/test', type=str,
                         help='dataset path for evaluation')
 
+    # 2.5D input: channels = (slice below, slice, slice above) from the same scan instead of 3 greyscale copies
+    parser.add_argument('--neighbour_slices', type=str2bool, default=False,
+                        help='Use neighbouring slices of the same scan as the 3 input channels (default: False)')
+    parser.add_argument('--neighbour_step', type=int, default=1,
+                        help='Slice offset of the neighbours, e.g. 2 = 2 slices either side (default: 1)')
+
     parser.add_argument('--nb_classes', default=2, type=int,
                         help='number of the classification types')
     parser.add_argument('--data_set', default='ADNI', choices=['CIFAR', 'ADNI'],
@@ -182,8 +188,9 @@ def get_args_parser():
 
 def build_model(args):
     # models are built straight from modules.py and trained from scratch (random initial weights)
-    if not hasattr(modules, args.model):
-        raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: convnext_tiny, convnext_tiny_bn")
+    available = sorted(n for n in dir(modules) if n.startswith('convnext_') and callable(getattr(modules, n)))
+    if args.model not in available:
+        raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: {', '.join(available)}")
     kwargs = dict(
         num_classes=args.nb_classes,
         drop_path_rate=args.drop_path, # reduce overfitting by dropping blocks in the model

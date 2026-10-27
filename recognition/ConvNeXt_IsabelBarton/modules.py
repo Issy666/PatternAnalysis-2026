@@ -301,3 +301,38 @@ def convnext_tiny_bn(**kwargs):
     model = ConvNeXtBN(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs) # same size as convnext_tiny, BN + head dropout
     return model
 
+
+# Smaller sizes, not in the ConvNeXt paper (it starts at Tiny): depths/dims from timm's convnext_atto ... convnext_nano
+# (R. Wightman, pytorch-image-models). Same blocks as Tiny, fewer and narrower; fewer weights to overfit the ~130 AD
+# training subjects. Parameter counts are for 2 classes.
+SMALL_CONFIGS = {
+    'atto':  ([2, 2, 6, 2], [40, 80, 160, 320]),   # 3.4 M
+    'femto': ([2, 2, 6, 2], [48, 96, 192, 384]),   # 4.8 M
+    'pico':  ([2, 2, 6, 2], [64, 128, 256, 512]),  # 8.5 M
+    'nano':  ([2, 2, 8, 2], [80, 160, 320, 640]),  # 15.0 M
+}
+
+def convnext_atto(**kwargs):
+    return ConvNeXt(depths=SMALL_CONFIGS['atto'][0], dims=SMALL_CONFIGS['atto'][1], **kwargs)
+
+def convnext_femto(**kwargs):
+    return ConvNeXt(depths=SMALL_CONFIGS['femto'][0], dims=SMALL_CONFIGS['femto'][1], **kwargs)
+
+def convnext_pico(**kwargs):
+    return ConvNeXt(depths=SMALL_CONFIGS['pico'][0], dims=SMALL_CONFIGS['pico'][1], **kwargs)
+
+def convnext_nano(**kwargs):
+    return ConvNeXt(depths=SMALL_CONFIGS['nano'][0], dims=SMALL_CONFIGS['nano'][1], **kwargs)
+
+def convnext_atto_bn(**kwargs):
+    return ConvNeXtBN(depths=SMALL_CONFIGS['atto'][0], dims=SMALL_CONFIGS['atto'][1], **kwargs)
+
+def convnext_femto_bn(**kwargs):
+    return ConvNeXtBN(depths=SMALL_CONFIGS['femto'][0], dims=SMALL_CONFIGS['femto'][1], **kwargs)
+
+def convnext_pico_bn(**kwargs):
+    return ConvNeXtBN(depths=SMALL_CONFIGS['pico'][0], dims=SMALL_CONFIGS['pico'][1], **kwargs)
+
+def convnext_nano_bn(**kwargs):
+    return ConvNeXtBN(depths=SMALL_CONFIGS['nano'][0], dims=SMALL_CONFIGS['nano'][1], **kwargs)
+
