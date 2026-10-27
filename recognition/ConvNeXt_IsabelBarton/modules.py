@@ -78,10 +78,11 @@ class ConvNeXt(nn.Module):
         dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768] <- from tiny
         drop_path_rate (float): Stochastic depth rate of the last block. Default: 0.1
         layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+        head_drop_rate (float): Dropout before the head. Default: 0 (as in the paper; --head_drop to change)
     """
     def __init__(self, in_chans=3, num_classes=1000,
                  depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.1,
-                 layer_scale_init_value=1e-6,
+                 layer_scale_init_value=1e-6, head_drop_rate=0.,
                  ): #param defaults
 
         super().__init__()
@@ -121,6 +122,9 @@ class ConvNeXt(nn.Module):
         # final norm on the pooled (N, 768) vector
         self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
 
+        # optional dropout on the pooled features (same place as ConvNeXtBN); 0 -> Identity, so the default is the paper's model
+        self.head_drop = nn.Dropout(head_drop_rate) if head_drop_rate > 0 else nn.Identity()
+
         self.head = nn.Linear(dims[-1], num_classes) #classifier: a fully connected layer from 768 features to num_classes = 2 outputs, one score (logit) for AD and one for NC
 
         self.apply(self._init_weights) # runs _init_weights on every layer in the model (trained from scratch, so these are the starting weights)
@@ -142,6 +146,7 @@ class ConvNeXt(nn.Module):
     def forward(self, x):
 
         x = self.forward_features(x)
+        x = self.head_drop(x) # only active in model.train()
         x = self.head(x)
         return x
 
@@ -335,4 +340,48 @@ def convnext_pico_bn(**kwargs):
 
 def convnext_nano_bn(**kwargs):
     return ConvNeXtBN(depths=SMALL_CONFIGS['nano'][0], dims=SMALL_CONFIGS['nano'][1], **kwargs)
+
+
+class SimpleCNN(nn.Module):
+    r""" Baseline for the open research dilemma: a plain CNN with none of ConvNeXt's design choices
+    (no patchify stem, no large-kernel depthwise convs, no inverted bottleneck, no LayerNorm/layer scale/drop path,
+    no residual connections).
+
+    4 blocks of 3x3 conv -> BatchNorm2d -> ReLU -> 2x2 max-pool, (N, 3, 256, 256) -> (N, 256, 16, 16),
+    then global average pooling -> dropout -> linear head. About 0.39 M parameters (ConvNeXt-Nano: 15.0 M).
+    Trained with exactly the same data, input (incl. 2.5D), augmentation, optimiser and schedule as ConvNeXt,
+    so only the architecture differs.
+
+    Args:
+        in_chans (int): Number of input channels. Default: 3
+        num_classes (int): Number of classes. Default: 2
+        dims (tuple(int)): Channels of the 4 blocks. Default: (32, 64, 128, 256)
+        head_drop_rate (float): Dropout before the head. Default: 0.4 (same as the BN ConvNeXt head)
+    """
+    def __init__(self, in_chans=3, num_classes=2, dims=(32, 64, 128, 256), head_drop_rate=0.4, **unused):
+        super().__init__()
+        # main.py passes ConvNeXt-only options (drop_path_rate, layer_scale_init_value); they don't apply here
+        layers, c_in = [], in_chans
+        for c_out in dims:
+            layers += [nn.Conv2d(c_in, c_out, kernel_size=3, padding=1, bias=False), # bias is redundant before BN
+                       nn.BatchNorm2d(c_out), nn.ReLU(inplace=True), nn.MaxPool2d(2)]
+            c_in = c_out
+        self.features = nn.Sequential(*layers)
+        self.head_drop = nn.Dropout(head_drop_rate)
+        self.head = nn.Linear(dims[-1], num_classes)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu') # standard init for ReLU nets
+            elif isinstance(m, nn.Linear):
+                trunc_normal_(m.weight, std=.02)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.features(x).mean([-2, -1]) # global average pooling, (N, 256, 16, 16) -> (N, 256)
+        return self.head(self.head_drop(x))
+
+
+def simple_cnn(**kwargs):
+    return SimpleCNN(**kwargs)
 

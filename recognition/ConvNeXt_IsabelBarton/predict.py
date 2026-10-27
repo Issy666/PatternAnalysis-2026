@@ -123,6 +123,91 @@ def print_metrics(title, m):
     print(f"  TP {m['tp']}  FN {m['fn']}  FP {m['fp']}  TN {m['tn']}")
 
 
+def plot_confusion(matrices, path):
+    """
+    Confusion matrices side by side, e.g. {'Slices (threshold 0.5)': metrics, 'Patients (...)': metrics}, where each
+    metrics dict has tp / fn / fp / tn (AD = positive). Rows = true class, columns = predicted class; each cell shows
+    the count and its share of the true class (so the diagonal is AD recall / NC recall).
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, len(matrices), figsize=(4.6 * len(matrices), 4.2), squeeze=False)
+    for ax, (name, m) in zip(axes[0], matrices.items()):
+        cm = [[m['tp'], m['fn']], [m['fp'], m['tn']]] # rows: true AD, true NC; columns: predicted AD, predicted NC
+        im = ax.imshow(cm, cmap='Blues', vmin=0)
+        for r in range(2):
+            row_total = sum(cm[r])
+            for c in range(2):
+                dark = cm[r][c] > max(max(row) for row in cm) / 2 # white text on dark cells
+                ax.text(c, r, f"{cm[r][c]:,}\n({cm[r][c] / row_total:.1%})", ha='center', va='center', fontsize=11,
+                        color='white' if dark else '#0b0b0b')
+        ax.set(xticks=[0, 1], yticks=[0, 1], xticklabels=CLASSES, yticklabels=CLASSES,
+               xlabel='Predicted', ylabel='True')
+        ax.set_title(f"{name}\naccuracy {m['acc1']:.1f}%, n = {m['num']:,}", fontsize=10)
+        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved {path}")
+
+
+def roc_curve(prob_ad, labels):
+    """
+    ROC with AD as the positive class: false positive rate (1 - NC recall) and true positive rate (AD recall) at
+    every threshold, from the highest score down, and the area under it (AUC, trapezoid rule).
+    AUC = the probability that a random AD case scores higher than a random NC case (0.5 = chance, 1 = perfect).
+    """
+    pairs = sorted(zip(prob_ad, labels), key=lambda x: -x[0])
+    n_pos = sum(label == 'AD' for _, label in pairs)
+    n_neg = len(pairs) - n_pos
+    fpr, tpr, tp, fp = [0.0], [0.0], 0, 0
+    for i, (p, label) in enumerate(pairs):
+        tp += label == 'AD'
+        fp += label != 'AD'
+        # one point per distinct score, so tied scores move diagonally instead of in a lucky order
+        if i == len(pairs) - 1 or pairs[i + 1][0] != p:
+            fpr.append(fp / n_neg)
+            tpr.append(tp / n_pos)
+    auc = sum((fpr[k] - fpr[k - 1]) * (tpr[k] + tpr[k - 1]) / 2 for k in range(1, len(fpr)))
+    return fpr, tpr, auc
+
+
+def plot_roc(curves, path):
+    """ROC curves on one plot, e.g. {'Slices': (prob_ad, labels, threshold), 'Patients': (...)}, each with its AUC
+    and a marker at its decision threshold (the operating point actually used)."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    colours = ['#eb6834', '#2a78d6', '#3a9a5b']
+    fig, ax = plt.subplots(figsize=(5.6, 5.2))
+    ax.plot([0, 1], [0, 1], '--', color='#898781', lw=1.5, label='Chance (AUC = 0.5)')
+    aucs = {}
+    for (name, (prob_ad, labels, threshold)), colour in zip(curves.items(), colours):
+        fpr, tpr, auc = roc_curve(prob_ad, labels)
+        aucs[name] = auc
+        ax.plot(fpr, tpr, color=colour, lw=2, label=f"{name} (AUC = {auc:.3f})")
+        # operating point at the threshold: AD if prob_AD > threshold
+        pred_ad = [p > threshold for p in prob_ad]
+        op_tpr = sum(a and l == 'AD' for a, l in zip(pred_ad, labels)) / sum(l == 'AD' for l in labels)
+        op_fpr = sum(a and l != 'AD' for a, l in zip(pred_ad, labels)) / sum(l != 'AD' for l in labels)
+        ax.plot(op_fpr, op_tpr, 'o', color=colour, ms=8, mec='#fcfcfb', mew=2)
+        ax.annotate(f"threshold {threshold}", (op_fpr, op_tpr), xytext=(8, -14), textcoords='offset points',
+                    fontsize=8, color=colour)
+    ax.set(xlim=(0, 1), ylim=(0, 1.02), xlabel='False positive rate (1 - NC recall)',
+           ylabel='True positive rate (AD recall)', title='ROC curve (AD = positive class)')
+    ax.grid(color='#e6e5e1', lw=0.8)
+    ax.set_axisbelow(True)
+    ax.legend(loc='lower right', fontsize=9, frameon=False)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"Saved {path}  ({', '.join(f'{k} AUC {v:.3f}' for k, v in aucs.items())})")
+    return aucs
+
+
 # ---------------------------------------------------------------------------
 # Calibration: expected calibration error (ECE) and reliability diagram
 # ---------------------------------------------------------------------------
@@ -482,6 +567,14 @@ def main(args):
     print_metrics(f"Patient level ({len(patients)} patients, mean prob_AD over slices, threshold {args.threshold})",
                   metrics)
     save_patient_results(patients, metrics, args.threshold, output_dir)
+    plot_confusion({'Slices (threshold 0.5)': slice_metrics,
+                    f'Patients (mean of slices, threshold {args.threshold})': metrics},
+                   os.path.join(output_dir, 'confusion_matrix.png'))
+    aucs = plot_roc({'Slices': ([p for _, _, p in slices], [label for _, label, _ in slices], 0.5),
+                     'Patients': ([p['prob_AD'] for p in patients], [p['label'] for p in patients], args.threshold)},
+                    os.path.join(output_dir, 'roc_curve.png'))
+    with open(os.path.join(output_dir, 'roc_auc.json'), 'w') as f:
+        json.dump({f'{k.lower()}_auc': v for k, v in aucs.items()}, f, indent=2)
 
     # calibration: does the model's confidence match how often it is right?
     calibrations = {

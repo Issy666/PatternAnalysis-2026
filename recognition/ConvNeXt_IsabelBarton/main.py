@@ -58,8 +58,10 @@ def get_args_parser():
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
                         help='Initial value of the per-channel layer scale (gamma); 0 disables it (default: 1e-6)')
 
-    parser.add_argument('--head_drop', type=float, default=0.4,
-                        help='Dropout before the classifier, BatchNorm (*_bn) models only (default: 0.4)')
+    # None = each model's own default: 0.4 for the BatchNorm (*_bn) models and simple_cnn, 0 for the LayerNorm ConvNeXt
+    parser.add_argument('--head_drop', type=float, default=None,
+                        help='Dropout before the classifier (default: model default, 0.4 for *_bn / simple_cnn, '
+                             '0 for LayerNorm convnext_*)')
 
     # EMA related parameters (off by default)
     parser.add_argument('--model_ema', type=str2bool, default=False,
@@ -188,7 +190,8 @@ def get_args_parser():
 
 def build_model(args):
     # models are built straight from modules.py and trained from scratch (random initial weights)
-    available = sorted(n for n in dir(modules) if n.startswith('convnext_') and callable(getattr(modules, n)))
+    available = sorted(n for n in dir(modules)
+                       if (n.startswith('convnext_') or n == 'simple_cnn') and callable(getattr(modules, n)))
     if args.model not in available:
         raise ValueError(f"Unknown model '{args.model}'. Available in modules.py: {', '.join(available)}")
     kwargs = dict(
@@ -196,8 +199,8 @@ def build_model(args):
         drop_path_rate=args.drop_path, # reduce overfitting by dropping blocks in the model
         layer_scale_init_value=args.layer_scale_init_value, #add a scalar to each block per channel to deterine the influence of each blocks
     )
-    if args.model.endswith('_bn'):
-        kwargs['head_drop_rate'] = args.head_drop # only the BN model has head dropout
+    if getattr(args, 'head_drop', None) is not None:
+        kwargs['head_drop_rate'] = args.head_drop # otherwise each model keeps its own default
     return getattr(modules, args.model)(**kwargs)
 
 
