@@ -1,17 +1,14 @@
-
+"""
+Preprocessing: pad to square, training-set mean/std normalisation (cached) and the train / eval transforms.
+"""
 import json
-import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from timm.data import create_transform
+from typing import Dict, List
+from timm.data.random_erasing import RandomErasing
 from torchvision import transforms
 
 import numpy as np
 from PIL import Image
-
-# ImageNet defaults — used as fallback when stats file not found
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD  = [0.229, 0.224, 0.225]
 
 # stored next to this file so the cache is found no matter which directory the script is run from
 DEFAULT_CACHE_DIR = str(Path(__file__).resolve().parent / "stats")
@@ -99,17 +96,15 @@ def compute_stats(
         sum_x2 += (arr ** 2).sum(axis=(0, 1))
 
     if n < 2:
-        print("[normalization] Not enough valid images — using ImageNet defaults")
-        stats = {"mean": IMAGENET_MEAN, "std": IMAGENET_STD}
-    else:
-        mean     = sum_x / n
-        variance = (sum_x2 - n * mean ** 2) / (n - 1)
-        std      = np.sqrt(variance)
-        stats = {
-            "mean": mean.tolist(),
-            "std":  std.tolist(),
-            "preprocess": preprocess,
-        }
+        raise RuntimeError(f"[normalization] No readable training images to compute '{disease}' stats from")
+    mean     = sum_x / n
+    variance = (sum_x2 - n * mean ** 2) / (n - 1)
+    std      = np.sqrt(variance)
+    stats = {
+        "mean": mean.tolist(),
+        "std":  std.tolist(),
+        "preprocess": preprocess,
+    }
 
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     with open(cache_path, "w") as f:
@@ -119,41 +114,6 @@ def compute_stats(
     print(f"  std  = {[f'{v:.4f}' for v in stats['std']]}")
     print(f"  Saved → {cache_path}")
     return stats
-
-
-def load_stats(
-    disease: str,
-    cache_dir: str = DEFAULT_CACHE_DIR,
-    fallback_to_imagenet: bool = True,
-) -> Dict[str, List[float]]:
-    """
-    Load precomputed stats from cache.
-
-    Falls back to ImageNet defaults if no cached file is found
-    and fallback_to_imagenet=True.
-    """
-    cache_path = Path(cache_dir) / f"{disease}_stats.json"
-    if cache_path.exists():
-        return _load_json(cache_path)
-
-    if fallback_to_imagenet:
-        print(
-            f"[normalization] No stats found for '{disease}'. "
-            "Using ImageNet defaults. Run compute_stats() first."
-        )
-        return {"mean": IMAGENET_MEAN, "std": IMAGENET_STD}
-
-    raise FileNotFoundError(
-        f"Stats file not found: {cache_path}. "
-        "Run compute_stats() first."
-    )
-
-
-def get_normalize_transform(stats: Dict[str, List[float]]):
-    """
-    Return a torchvision.transforms.Normalize object from a stats dict.
-    """
-    return transforms.Normalize(mean=stats["mean"], std=stats["std"])
 
 
 def build_transform(is_train,
@@ -167,8 +127,8 @@ def build_transform(is_train,
     Parameters
     ----------
     is_train : bool
-        If True, returns the timm augmentation pipeline (random crop/flip,
-        colour jitter, RandAugment, random erasing). Requires args.
+        If True, returns the training augmentation pipeline (random affine,
+        brightness/contrast, random erasing). Requires args.
     img_size : int
         Output height and width.
 
@@ -176,21 +136,28 @@ def build_transform(is_train,
     is never stretched.
     """
     if is_train:
-        # this should always dispatch to transforms_imagenet_train
-        timm_transform = create_transform(
-            input_size=img_size,
-            is_training=True,
-            color_jitter=args.color_jitter,
-            auto_augment=args.aa,
-            interpolation=args.train_interpolation,
-            re_prob=args.reprob,
-            re_mode=args.remode,
-            re_count=args.recount,
-            mean=stats["mean"],
-            std=stats["std"],
-        )
-        # pad before timm's random resized crop so crops are taken from an undistorted square image
-        return transforms.Compose([PadToSquare(), *timm_transform.transforms])
+        # ADNI-specific instead of the paper's ImageNet pipeline (RandomResizedCrop 8-100% + horizontal flip):
+        # AD shows up as SIZE/SHAPE changes (bigger ventricles, smaller hippocampus), so augmentation only mimics
+        # small differences in head position and size, and never stretches or mirrors the brain (see README)
+        return transforms.Compose([
+            PadToSquare(),
+            transforms.Resize((img_size, img_size)), # no-op at 256 (same as eval)
+            transforms.RandomAffine(
+                degrees=args.affine_degrees,                               # rotate +-degrees (head tilt)
+                translate=(args.affine_translate, args.affine_translate),  # shift up to +-fraction of the image
+                scale=(1 - args.affine_scale, 1 + args.affine_scale),      # zoom (head size / scanner FOV)
+                interpolation=transforms.InterpolationMode.BILINEAR,
+                fill=0,                                                    # new corners are black, like the background
+            ),
+            # no horizontal flip: every sagittal slice faces the same way, and a mirrored brain never appears at test
+            # random brightness/contrast (intensity) mimics scanner and acquisition differences between patients;
+            # 0 (the default) = no change. Brightness scales pixels, so the black background stays black
+            transforms.ColorJitter(brightness=args.brightness, contrast=args.contrast),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=stats["mean"], std=stats["std"]),
+            # erase one random rectangle (filled with random noise) in 25% of images, after normalisation as in timm
+            RandomErasing(probability=args.reprob, mode='pixel', max_count=1, device='cpu'),
+        ])
 
     t = []
     t.append(PadToSquare())

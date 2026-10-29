@@ -1,12 +1,30 @@
+"""
+Train a model on ADNI (AD vs NC), validating every epoch, then test the best validation checkpoint once.
 
+    python main.py --model convnext_tiny_bn --neighbour_slices True --output_dir ~/Desktop/results/<run> ...
+
+Usually launched through testscripts/run_pipeline.sh, which also checks the data first and analyses the predictions.
+Writes to --output_dir: checkpoint-<epoch>.pth / checkpoint-best.pth, log.txt (one JSON line per epoch),
+test_results.json and test_predictions.csv.
+"""
 import argparse
+import datetime
+import json
+import os
+import time
 import torch
-import torch.nn as nn
 import torch.backends.cudnn as cudnn
 import numpy as np
 from pathlib import Path
+
+from timm.loss import LabelSmoothingCrossEntropy
+
 from dataset import build_dataset
-import normalise
+from modules import build_model
+from train import create_optimizer, train_one_epoch, evaluate
+from predict import run_test, patient_predictions, classification_metrics
+from utils import NativeScalerWithGradNormCount as NativeScaler
+import utils
 
 
 def str2bool(v):
@@ -22,444 +40,262 @@ def str2bool(v):
 
 def get_args_parser():
     parser = argparse.ArgumentParser('ConvNeXt training + evaluation script for MRI AD or CN classification', add_help=False)
-    
-    parser.add_argument('--batch_size', default=64, type=int,
-                        help='Per GPU batch size')
-    parser.add_argument('--epochs', default=150, type=int)
 
-    parser.add_argument('--update_freq', default=1, type=int,
-                        help='gradient accumulation steps')
+    parser.add_argument('--batch_size', default=64, type=int,
+                        help='Batch size')
+    parser.add_argument('--epochs', default=60, type=int) # 100-epoch run peaked on val at 55, so cosine decay now finishes around there
 
     # Model parameters
-    parser.add_argument('--model', default='convnext', type=str,
-                        help='Name of model to train')
+    parser.add_argument('--model', default='convnext_tiny', type=str,
+                        help='Model to train: convnext_tiny, convnext_tiny_bn, convnext_nano_bn or simple_cnn (modules.py)')
 
-    parser.add_argument('--drop_path', type=float, default=0,
-                        help='Drop path rate (default: 0.0)')
-                        
+    parser.add_argument('--drop_path', type=float, default=0.1,
+                        help='Drop path (stochastic depth) rate (default: 0.1)')
+
     parser.add_argument('--input_size', default=256, type=int,
                         help='image input size')
 
     parser.add_argument('--layer_scale_init_value', default=1e-6, type=float,
-                        help="Layer scale initial values")
+                        help='Initial value of the per-channel layer scale (gamma); 0 disables it (default: 1e-6)')
 
-    # EMA related parameters
-    parser.add_argument('--model_ema', type=str2bool, default=False)
-    parser.add_argument('--model_ema_decay', type=float, default=0.9999, help='')
-    parser.add_argument('--model_ema_force_cpu', type=str2bool, default=False, help='')
-    parser.add_argument('--model_ema_eval', type=str2bool, default=False, help='Using ema to eval during training.')
+    # None = each model's own default: 0.4 for the BatchNorm (*_bn) models and simple_cnn, 0 for the LayerNorm ConvNeXt
+    parser.add_argument('--head_drop', type=float, default=None,
+                        help='Dropout before the classifier (default: model default, 0.4 for *_bn / simple_cnn, '
+                             '0 for convnext_tiny)')
 
-    # Optimization parameters
-    parser.add_argument('--opt', default='adamw', type=str,
-                        help='Optimizer (default: "adamw"')
-
-    parser.add_argument('--opt_eps', default=1e-8, type=float,
-                        help='Optimizer Epsilon (default: 1e-8)')
-
-    parser.add_argument('--opt_betas', default=None, type=float, nargs='+',
-                        help='Optimizer Betas (default: None, use opt default)')
-    
-    parser.add_argument('--clip_grad', type=float, default=None,
-                        help='Clip gradient norm (default: None, no clipping)')
-    
-    parser.add_argument('--momentum', type=float, default=0.9,
-                        help='SGD momentum (default: 0.9)')
-    
+    # Optimization parameters (optimiser is always AdamW, see train.create_optimizer)
     parser.add_argument('--weight_decay', type=float, default=0.05,
                         help='weight decay (default: 0.05)')
-    
-    parser.add_argument('--weight_decay_end', type=float, default=None, help="""Final value of the
-        weight decay. We use a cosine schedule for WD and using a larger decay by
-        the end of training improves performance for ViTs.""")
 
-    parser.add_argument('--lr', type=float, default=4e-3,
-                        help='learning rate (default: 4e-3)')
-
-    parser.add_argument('--layer_decay', type=float, default=1.0)
+    # paper's 4e-3 is for batch 4096; square-root scaled to batch 64: 4e-3 * sqrt(64/4096) = 5e-4
+    parser.add_argument('--lr', type=float, default=5e-4,
+                        help='peak learning rate (default: 5e-4)')
 
     parser.add_argument('--min_lr', type=float, default=1e-6,
-                        help='lower lr bound for cyclic schedulers that hit 0 (1e-6)')
-    
-    parser.add_argument('--warmup_epochs', type=int, default=20,
-                        help='epochs to warmup LR, if scheduler supports')
+                        help='learning rate at the end of the cosine decay (default: 1e-6)')
 
-    parser.add_argument('--warmup_steps', type=int, default=-1,
-                        help='num of steps to warmup LR, will overload warmup_epochs if set > 0')
+    parser.add_argument('--warmup_epochs', type=int, default=5, # ~8% of 60 epochs, close to the paper's 20 of 300
+                        help='epochs of linear learning-rate warmup')
 
-    # Augmentation parameters
-    parser.add_argument('--aa', type=str, default='',
-                        help='Use AutoAugment policy. "v0" or "original". " + "(default: rand-m9-mstd0.5-inc1)')
-    parser.add_argument('--color_jitter', type=float, default=0, metavar='PCT',
-                        help='Color jitter factor (default: 0.4)')
+    # Augmentation parameters (no RandomResizedCrop / flip / RandAugment / mixup: see normalise.build_transform and README)
+    parser.add_argument('--affine_degrees', type=float, default=10,
+                        help='Random rotation range in degrees, +-value (default: 10)')
+    parser.add_argument('--affine_translate', type=float, default=0.05,
+                        help='Random shift as a fraction of image size, +-value (default: 0.05)')
+    parser.add_argument('--affine_scale', type=float, default=0.05,
+                        help='Random zoom range, 1 +- value (default: 0.05)')
+    parser.add_argument('--brightness', type=float, default=0.0,
+                        help='Random brightness factor range, 1 +- value (default: 0, off)')
+    parser.add_argument('--contrast', type=float, default=0.0,
+                        help='Random contrast factor range, 1 +- value (default: 0, off)')
+    parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
+                        help='Random erase probability: one noise-filled rectangle per image (default: 0.25)')
     parser.add_argument('--smoothing', type=float, default=0.1,
                         help='Label smoothing (default: 0.1)')
-    parser.add_argument('--train_interpolation', type=str, default='bilinear',
-                        help='Training interpolation (random, bilinear, bicubic default: "bicubic")')
-
-    # Evaluation parameters
-    parser.add_argument('--crop_pct', type=float, default=None)
-
-    # * Random Erase params
-    parser.add_argument('--reprob', type=float, default=0.25, metavar='PCT',
-                        help='Random erase prob (default: 0.25)')
-    parser.add_argument('--remode', type=str, default='pixel',
-                        help='Random erase mode (default: "pixel")')
-    parser.add_argument('--recount', type=int, default=1,
-                        help='Random erase count (default: 1)')
-
-    # * Mixup params
-    parser.add_argument('--mixup', type=float, default=0.8,
-                        help='mixup alpha, mixup enabled if > 0.')
-
-    parser.add_argument('--cutmix', type=float, default=1.0,
-                        help='cutmix alpha, cutmix enabled if > 0.')
-
-    parser.add_argument('--cutmix_minmax', type=float, nargs='+', default=None,
-                        help='cutmix min/max ratio, overrides alpha and enables cutmix if set (default: None)')
-
-    parser.add_argument('--mixup_prob', type=float, default=1.0,
-                        help='Probability of performing mixup or cutmix when either/both is enabled')
-
-    parser.add_argument('--mixup_switch_prob', type=float, default=0.5,
-                        help='Probability of switching to cutmix when both mixup and cutmix enabled')
-
-    parser.add_argument('--mixup_mode', type=str, default='batch',
-                        help='How to apply mixup/cutmix params. Per "batch", "pair", or "elem"')
-
-    # * Finetuning params
-    parser.add_argument('--finetune', default='',
-                        help='finetune from checkpoint')
-
-    parser.add_argument('--head_init_scale', default=1.0, type=float,
-                        help='classifier head initial scale, typically adjusted in fine-tuning')
-
-    parser.add_argument('--model_key', default='model|module', type=str,
-                        help='which key to load from saved state dict, usually model or model_ema')
-
-    parser.add_argument('--model_prefix', default='', type=str)
 
     # Dataset parameters
-    parser.add_argument('--data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/train', type=str,
-                        help='dataset path')
-    parser.add_argument('--val_data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/validation', type=str,
-                        help='dataset path')
-    parser.add_argument('--eval_data_path', default='/home/isabel/Desktop/data/ADNI/AD_NC/test', type=str,
-                        help='dataset path for evaluation')
+    parser.add_argument('--data_path', default='/home/isabel/Desktop/data/ADNI_patientleakagefix/AD_NC/train', type=str,
+                        help='training images (folder containing AD/ and NC/)')
+    parser.add_argument('--val_data_path', default='/home/isabel/Desktop/data/ADNI_patientleakagefix/AD_NC/validation', type=str,
+                        help='validation images, used for checkpoint selection')
+    parser.add_argument('--eval_data_path', default='/home/isabel/Desktop/data/ADNI_patientleakagefix/AD_NC/test', type=str,
+                        help='test images, evaluated once at the end')
 
-    parser.add_argument('--nb_classes', default=2, type=int,
-                        help='number of the classification types')
-    parser.add_argument('--data_set', default='ADNI', choices=['CIFAR', 'ADNI'],
-                        type=str, help='dataset path')
-    parser.add_argument('--stats_dir', default=normalise.DEFAULT_CACHE_DIR, type=str,
-                        help='where the training-set mean/std JSON is cached')
+    # 3 channels = (slice below, slice, slice above) from the same scan instead of 3 greyscale copies
+    parser.add_argument('--neighbour_slices', type=str2bool, default=False,
+                        help='Use neighbouring slices of the same scan as the 3 input channels (default: False)')
+    parser.add_argument('--neighbour_step', type=int, default=1,
+                        help='Slice offset of the neighbours, e.g. 2 = 2 slices either side (default: 1)')
+
     parser.add_argument('--num_workers', default=4, type=int)
-    parser.add_argument('--pin_mem', type=str2bool, default=True,
-                        help='Pin CPU memory in DataLoader for more efficient transfer to GPU.')
     parser.add_argument('--output_dir', default='/home/isabel/Desktop/results',
-                        help='path where to save, empty for no saving')
-    parser.add_argument('--log_dir', default='/home/isabel/Desktop/log',
-                        help='path where to tensorboard log')
-    parser.add_argument('--device', default='cuda',
-                        help='device to use for training / testing')
+                        help='where checkpoints, log.txt and test results are saved (use a new folder per run)')
     parser.add_argument('--seed', default=0, type=int)
 
+    # Checkpointing / resuming
+    parser.add_argument('--save_ckpt_num', default=3, type=int,
+                        help='number of recent epoch checkpoints to keep (checkpoint-best.pth is always kept)')
+    parser.add_argument('--resume', default='',
+                        help='checkpoint to resume training from (default: the latest one in output_dir, if any)')
 
-    parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
-                        help='start epoch')
-    parser.add_argument('--eval', type=str2bool, default=False,
-                        help='Perform evaluation only')
-    parser.add_argument('--dist_eval', type=str2bool, default=True,
-                        help='Enabling distributed evaluation')
-    parser.add_argument('--disable_eval', type=str2bool, default=False,
-                        help='Disabling evaluation during training')
-
-    # Weights and Biases arguments
-    parser.add_argument('--enable_wandb', type=str2bool, default=False,
-                        help="enable logging to Weights and Biases")
-    parser.add_argument('--project', default='convnext', type=str,
-                        help="The name of the W&B project where you're sending the new run.")
-    parser.add_argument('--wandb_ckpt', type=str2bool, default=False,
-                        help="Save model checkpoints as W&B Artifacts.")
+    # which validation score picks checkpoint-best.pth. slice accuracy hides the AD/NC split of errors and jumps
+    # around by luck; patient macro-F1 weights AD and NC equally, ties go to the lower validation loss
+    parser.add_argument('--best_metric', default='acc1', choices=['acc1', 'patient_macro_f1'],
+                        help='Validation metric used to choose checkpoint-best.pth (default: acc1)')
 
     return parser
 
+
+def val_patient_metrics(dataset, probs):
+    # probs are in dataset.samples order (val loader isn't shuffled); column 0 = P(AD)
+    idx_to_class = {v: k for k, v in dataset.class_to_idx.items()}
+    slices = [(path, idx_to_class[target], p[0]) for (path, target), p in zip(dataset.samples, probs.tolist())]
+    return classification_metrics(patient_predictions(slices))
+
+
 def main(args):
+
     print(args)
-    #device to run on
-    device = torch.device(args.device)
+
+    # training always uses AMP (autocast/GradScaler on 'cuda'), so it needs a CUDA GPU
+    if not torch.cuda.is_available():
+        raise SystemExit("main.py needs a CUDA GPU (training always uses mixed precision); "
+                         "use predict.py --resume <checkpoint> to evaluate a trained model on a CPU")
+    device = torch.device('cuda')
 
     # fix the seed for reproducibility
-    seed = args.seed
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+
     #enables the NVIDIA cuDNN auto-tuner to test multiple convolution algorithms and select the fastest one for your GPU  Works for inputs that are the same size
     cudnn.benchmark = True
 
-    dataset_train, args.nb_classes = build_dataset(split='train', args=args)
-    if args.disable_eval:
-        args.dist_eval = False
-        dataset_val = None
+    dataset_train = build_dataset(split='train', args=args)
+    dataset_val = build_dataset(split='val', args=args)
+    dataset_test = build_dataset(split='test', args=args)
+
+    # shuffle=True reshuffles the training data every epoch; pinned memory speeds up the copy to the GPU
+    data_loader_train = torch.utils.data.DataLoader(
+        dataset_train, shuffle=True,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,
+    )
+    # validation and test are evaluated in order, so predictions line up with dataset.samples
+    data_loader_val = torch.utils.data.DataLoader(
+        dataset_val, shuffle=False,
+        batch_size=int(1.5 * args.batch_size),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False
+    )
+    data_loader_test = torch.utils.data.DataLoader(
+        dataset_test, shuffle=False,
+        batch_size=int(1.5 * args.batch_size),
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=False
+    )
+
+    # mixup/cutmix from the paper removed for ADNI: they blend or paste two brains together, so the label no longer
+    # matches the anatomy that defines AD vs NC (see README "Why mixup and CutMix are not used")
+
+    #build the model (trained from scratch: random initial weights)
+    model = build_model(args)
+    model.to(device)
+
+    #No. OF TRAINABLE PARAMATERS IN THE ENTIRE MODEL
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # RUn details
+    print("Model = %s" % str(model))
+    print('number of params:', n_parameters)
+
+    # optimizer steps per epoch (rounded down), e.g. 18,260 // 64 = 285; the lr schedule is built per step from this
+    num_training_steps_per_epoch = len(dataset_train) // args.batch_size
+
+    print("LR = %.8f" % args.lr)
+    print("Batch size = %d" % args.batch_size)
+    print("Number of training examples = %d" % len(dataset_train))
+    print("Number of training steps per epoch = %d" % num_training_steps_per_epoch)
+
+    #choose optimiser
+    optimizer = create_optimizer(args, model)
+
+    # AMP loss scaler: float16 rounds tiny gradients to 0, so the loss is multiplied by a large factor before backward(),
+    # gradients are divided back before the optimiser step, and steps with inf/NaN gradients are skipped (factor then halved)
+    loss_scaler = NativeScaler()
+
+    # one lr per optimizer step for the whole run
+    # linear warmup 0 -> lr (random init gives large, unreliable early gradients), then cosine decay lr -> min_lr
+    # (big exploring steps early, small settling steps at the end)
+    print("Use Cosine LR scheduler")
+    lr_schedule_values = utils.cosine_scheduler(
+        args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch, warmup_epochs=args.warmup_epochs,
+    )
+
+    # cross-entropy with label smoothing: target [1, 0] becomes [0.95, 0.05] (0.9 x one-hot + 0.1 x uniform),
+    # so the model is penalised for being over-confident; plain cross-entropy if --smoothing 0
+    if args.smoothing > 0.:
+        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
     else:
-        dataset_val, _ = build_dataset(split='val', args=args)
-    dataset_test, _ = build_dataset(split='test', args=args)
+        criterion = torch.nn.CrossEntropyLoss()
 
-    # num_tasks = utils.get_world_size()
-    # global_rank = utils.get_rank()
+    print("criterion = %s" % str(criterion))
 
-    # sampler_train = torch.utils.data.DistributedSampler(
-    #     dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True, seed=args.seed,
-    # )
-    # print("Sampler_train = %s" % str(sampler_train))
-    # if args.dist_eval:
-    #     if len(dataset_val) % num_tasks != 0:
-    #         print('Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-    #                 'This will slightly alter validation results as extra duplicate entries are added to achieve '
-    #                 'equal num of samples per-process.')
-    #     sampler_val = torch.utils.data.DistributedSampler(
-    #         dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-    # else:
-    #     sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+    # resume an interrupted run: loads the latest checkpoint-<epoch>.pth in output_dir (or --resume <path>) and restores
+    # weights, AdamW state, AMP scale and start_epoch, so training and the lr schedule continue where they stopped.
+    # use a new output_dir per run
+    args.start_epoch = 0
+    utils.auto_load_model(args=args, model=model, optimizer=optimizer, loss_scaler=loss_scaler)
 
-    # if global_rank == 0 and args.log_dir is not None:
-    #     os.makedirs(args.log_dir, exist_ok=True)
-    #     log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
-    # else:
-    #     log_writer = None
+    max_accuracy = 0.0 #accuracy counter
+    best_score, best_epoch = None, None # (best_metric, -val loss) of checkpoint-best.pth, compared as a tuple
 
-    # if global_rank == 0 and args.enable_wandb:
-    #     wandb_logger = utils.WandbLogger(args)
-    # else:
-    #     wandb_logger = None
+    print("Start training for %d epochs" % args.epochs)
+    #start epock timer
+    start_time = time.time()
+    for epoch in range(args.start_epoch, args.epochs):
+        train_stats = train_one_epoch(
+            model, criterion, data_loader_train, optimizer, device, epoch, loss_scaler,
+            start_steps=epoch * num_training_steps_per_epoch, lr_schedule_values=lr_schedule_values,
+            num_training_steps_per_epoch=num_training_steps_per_epoch,
+        )
 
-    # data_loader_train = torch.utils.data.DataLoader(
-    #     dataset_train, sampler=sampler_train,
-    #     batch_size=args.batch_size,
-    #     num_workers=args.num_workers,
-    #     pin_memory=args.pin_mem,
-    #     drop_last=True,
-    # )
+        # save results of epoch
+        utils.save_model(args=args, model=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch=epoch)
 
-    # if dataset_val is not None:
-    #     data_loader_val = torch.utils.data.DataLoader(
-    #         dataset_val, sampler=sampler_val,
-    #         batch_size=int(1.5 * args.batch_size),
-    #         num_workers=args.num_workers,
-    #         pin_memory=args.pin_mem,
-    #         drop_last=False
-    #     )
-    # else:
-    #     data_loader_val = None
+        # run validation after each epoch
+        val_stats, val_probs, _ = evaluate(data_loader_val, model, device, use_amp=True, header='Val:',
+                                           return_preds=True)
+        print(f"Accuracy of the model on the {len(dataset_val)} validation images: {val_stats['acc1']:.1f}%")
+        # patient level: average each patient's 20 slice probabilities, as predict.py does for test
+        val_stats.update({f'patient_{k}': v for k, v in val_patient_metrics(dataset_val, val_probs).items()})
+        print(f"Patient-level validation: accuracy {val_stats['patient_acc1']:.1f}%  "
+              f"AD recall {val_stats['patient_ad_recall']:.3f}  macro-F1 {val_stats['patient_macro_f1']:.3f}")
+        max_accuracy = max(max_accuracy, val_stats["acc1"])
+        score = (val_stats[args.best_metric], -val_stats['loss'])
+        if best_score is None or score > best_score:
+            best_score, best_epoch = score, epoch
+            # save the latest updated weights
+            utils.save_model(args=args, model=model, optimizer=optimizer, loss_scaler=loss_scaler, epoch="best")
+        print(f'Max validation accuracy: {max_accuracy:.2f}%  '
+              f'best {args.best_metric}: {best_score[0]:.4f} (epoch {best_epoch})')
 
-    # mixup_fn = None
-    # mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    # if mixup_active:
-    #     print("Mixup is activated!")
-    #     mixup_fn = Mixup(
-    #         mixup_alpha=args.mixup, cutmix_alpha=args.cutmix, cutmix_minmax=args.cutmix_minmax,
-    #         prob=args.mixup_prob, switch_prob=args.mixup_switch_prob, mode=args.mixup_mode,
-    #         label_smoothing=args.smoothing, num_classes=args.nb_classes)
+        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                     **{f'val_{k}': v for k, v in val_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters}
+        with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
+            f.write(json.dumps(log_stats) + "\n")
 
-    # model = create_model(
-    #     args.model, 
-    #     pretrained=False, 
-    #     num_classes=args.nb_classes, 
-    #     drop_path_rate=args.drop_path,
-    #     layer_scale_init_value=args.layer_scale_init_value,
-    #     head_init_scale=args.head_init_scale,
-    #     )
+    total_time = time.time() - start_time # final epoch time
+    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
+    print('Training time {}'.format(total_time_str))
 
-    # if args.finetune:
-    #     if args.finetune.startswith('https'):
-    #         checkpoint = torch.hub.load_state_dict_from_url(
-    #             args.finetune, map_location='cpu', check_hash=True)
-    #     else:
-    #         checkpoint = torch.load(args.finetune, map_location='cpu')
-
-    #     print("Load ckpt from %s" % args.finetune)
-    #     checkpoint_model = None
-    #     for model_key in args.model_key.split('|'):
-    #         if model_key in checkpoint:
-    #             checkpoint_model = checkpoint[model_key]
-    #             print("Load state_dict by model_key = %s" % model_key)
-    #             break
-    #     if checkpoint_model is None:
-    #         checkpoint_model = checkpoint
-    #     state_dict = model.state_dict()
-    #     for k in ['head.weight', 'head.bias']:
-    #         if k in checkpoint_model and checkpoint_model[k].shape != state_dict[k].shape:
-    #             print(f"Removing key {k} from pretrained checkpoint")
-    #             del checkpoint_model[k]
-    #     utils.load_state_dict(model, checkpoint_model, prefix=args.model_prefix)
-    # model.to(device)
-
-    # model_ema = None
-    # if args.model_ema:
-    #     # Important to create EMA model after cuda(), DP wrapper, and AMP but before SyncBN and DDP wrapper
-    #     model_ema = ModelEma(
-    #         model,
-    #         decay=args.model_ema_decay,
-    #         device='cpu' if args.model_ema_force_cpu else '',
-    #         resume='')
-    #     print("Using EMA with decay = %.8f" % args.model_ema_decay)
-
-    # model_without_ddp = model
-    # n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # print("Model = %s" % str(model_without_ddp))
-    # print('number of params:', n_parameters)
-
-    # total_batch_size = args.batch_size * args.update_freq * utils.get_world_size()
-    # num_training_steps_per_epoch = len(dataset_train) // total_batch_size
-    # print("LR = %.8f" % args.lr)
-    # print("Batch size = %d" % total_batch_size)
-    # print("Update frequent = %d" % args.update_freq)
-    # print("Number of training examples = %d" % len(dataset_train))
-    # print("Number of training training per epoch = %d" % num_training_steps_per_epoch)
-
-    # if args.layer_decay < 1.0 or args.layer_decay > 1.0:
-    #     num_layers = 12 # convnext layers divided into 12 parts, each with a different decayed lr value.
-    #     assert args.model in ['convnext_small', 'convnext_base', 'convnext_large', 'convnext_xlarge'], \
-    #          "Layer Decay impl only supports convnext_small/base/large/xlarge"
-    #     assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
-    # else:
-    #     assigner = None
-
-    # if assigner is not None:
-    #     print("Assigned values = %s" % str(assigner.values))
-
-    # if args.distributed:
-    #     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
-    #     model_without_ddp = model.module
-
-    # optimizer = create_optimizer(
-    #     args, model_without_ddp, skip_list=None,
-    #     get_num_layer=assigner.get_layer_id if assigner is not None else None, 
-    #     get_layer_scale=assigner.get_scale if assigner is not None else None)
-
-    # loss_scaler = NativeScaler() # if args.use_amp is False, this won't be used
-
-    # print("Use Cosine LR scheduler")
-    # lr_schedule_values = utils.cosine_scheduler(
-    #     args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
-    #     warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
-    # )
-
-    # if args.weight_decay_end is None:
-    #     args.weight_decay_end = args.weight_decay
-    # wd_schedule_values = utils.cosine_scheduler(
-    #     args.weight_decay, args.weight_decay_end, args.epochs, num_training_steps_per_epoch)
-    # print("Max WD = %.7f, Min WD = %.7f" % (max(wd_schedule_values), min(wd_schedule_values)))
-
-    # if mixup_fn is not None:
-    #     # smoothing is handled with mixup label transform
-    #     criterion = SoftTargetCrossEntropy()
-    # elif args.smoothing > 0.:
-    #     criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    # else:
-    #     criterion = torch.nn.CrossEntropyLoss()
-
-    # print("criterion = %s" % str(criterion))
-
-    # utils.auto_load_model(
-    #     args=args, model=model, model_without_ddp=model_without_ddp,
-    #     optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
-
-    # if args.eval:
-    #     print(f"Eval only mode")
-    #     test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-    #     print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
-    #     return
-
-    # max_accuracy = 0.0
-    # if args.model_ema and args.model_ema_eval:
-    #     max_accuracy_ema = 0.0
-
-    # print("Start training for %d epochs" % args.epochs)
-    # start_time = time.time()
-    # for epoch in range(args.start_epoch, args.epochs):
-    #     if args.distributed:
-    #         data_loader_train.sampler.set_epoch(epoch)
-    #     if log_writer is not None:
-    #         log_writer.set_step(epoch * num_training_steps_per_epoch * args.update_freq)
-    #     if wandb_logger:
-    #         wandb_logger.set_steps()
-    #     train_stats = train_one_epoch(
-    #         model, criterion, data_loader_train, optimizer,
-    #         device, epoch, loss_scaler, args.clip_grad, model_ema, mixup_fn,
-    #         log_writer=log_writer, wandb_logger=wandb_logger, start_steps=epoch * num_training_steps_per_epoch,
-    #         lr_schedule_values=lr_schedule_values, wd_schedule_values=wd_schedule_values,
-    #         num_training_steps_per_epoch=num_training_steps_per_epoch, update_freq=args.update_freq,
-    #         use_amp=args.use_amp
-    #     )
-    #     if args.output_dir and args.save_ckpt:
-    #         if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
-    #             utils.save_model(
-    #                 args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-    #                 loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
-    #     if data_loader_val is not None:
-    #         test_stats = evaluate(data_loader_val, model, device, use_amp=args.use_amp)
-    #         print(f"Accuracy of the model on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
-    #         if max_accuracy < test_stats["acc1"]:
-    #             max_accuracy = test_stats["acc1"]
-    #             if args.output_dir and args.save_ckpt:
-    #                 utils.save_model(
-    #                     args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-    #                     loss_scaler=loss_scaler, epoch="best", model_ema=model_ema)
-    #         print(f'Max accuracy: {max_accuracy:.2f}%')
-
-    #         if log_writer is not None:
-    #             log_writer.update(test_acc1=test_stats['acc1'], head="perf", step=epoch)
-    #             log_writer.update(test_acc5=test_stats['acc5'], head="perf", step=epoch)
-    #             log_writer.update(test_loss=test_stats['loss'], head="perf", step=epoch)
-
-    #         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-    #                      **{f'test_{k}': v for k, v in test_stats.items()},
-    #                      'epoch': epoch,
-    #                      'n_parameters': n_parameters}
-
-    #         # repeat testing routines for EMA, if ema eval is turned on
-    #         if args.model_ema and args.model_ema_eval:
-    #             test_stats_ema = evaluate(data_loader_val, model_ema.ema, device, use_amp=args.use_amp)
-    #             print(f"Accuracy of the model EMA on {len(dataset_val)} test images: {test_stats_ema['acc1']:.1f}%")
-    #             if max_accuracy_ema < test_stats_ema["acc1"]:
-    #                 max_accuracy_ema = test_stats_ema["acc1"]
-    #                 if args.output_dir and args.save_ckpt:
-    #                     utils.save_model(
-    #                         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-    #                         loss_scaler=loss_scaler, epoch="best-ema", model_ema=model_ema)
-    #                 print(f'Max EMA accuracy: {max_accuracy_ema:.2f}%')
-    #             if log_writer is not None:
-    #                 log_writer.update(test_acc1_ema=test_stats_ema['acc1'], head="perf", step=epoch)
-    #             log_stats.update({**{f'test_{k}_ema': v for k, v in test_stats_ema.items()}})
-    #     else:
-    #         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-    #                      'epoch': epoch,
-    #                      'n_parameters': n_parameters}
-
-    #     if args.output_dir and utils.is_main_process():
-    #         if log_writer is not None:
-    #             log_writer.flush()
-    #         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
-    #             f.write(json.dumps(log_stats) + "\n")
-
-    #     if wandb_logger:
-    #         wandb_logger.log_epoch_metrics(log_stats)
-
-    # if wandb_logger and args.wandb_ckpt and args.save_ckpt and args.output_dir:
-    #     wandb_logger.log_checkpoints()
-
-
-    # total_time = time.time() - start_time
-    # total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    # print('Training time {}'.format(total_time_str))
-
-
-
+    # final, one-off evaluation on the held-out test split using the best validation checkpoint
+    checkpoint_name = 'final epoch weights'
+    best_path = Path(args.output_dir) / 'checkpoint-best.pth'
+    if best_path.exists():
+        checkpoint = torch.load(best_path, map_location='cpu', weights_only=False)
+        model.load_state_dict(checkpoint['model'])
+        checkpoint_name = str(best_path)
+    extra = {
+        'best_val_acc1': max_accuracy,
+        'best_metric': args.best_metric,
+        'best_val_score': best_score[0] if best_score else None,
+        'best_epoch': best_epoch,
+        'epochs_trained_this_run': args.epochs - args.start_epoch,
+        'training_time_this_run': total_time_str,
+        'max_gpu_mem_mb': torch.cuda.max_memory_allocated() / 1024 ** 2,
+        'n_parameters': n_parameters,
+    }
+    run_test(model, data_loader_test, dataset_test, device, args, checkpoint_name, extra)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ConvNeXt training + evaluation script', parents=[get_args_parser()])
     args = parser.parse_args()
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     main(args)
