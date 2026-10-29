@@ -1,11 +1,12 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+Training helpers: console logging (SmoothedValue, MetricLogger), the AMP loss scaler, the warmup + cosine
+learning-rate schedule, and checkpoint saving / resuming / loading.
 
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-# Training helpers: console logging (MetricLogger), AMP loss scaling, the lr schedule and checkpoints.
+Reference: everything except load_trained_model is adapted from the official ConvNeXt implementation [2]
+(Copyright (c) Meta Platforms, Inc. and affiliates, MIT licence):
+https://github.com/facebookresearch/ConvNeXt/blob/main/utils.py
+Parts of the original not needed here (e.g. distributed training) were removed.
+"""
 
 import glob
 import os
@@ -33,6 +34,7 @@ class SmoothedValue(object):
         self.fmt = fmt
 
     def update(self, value, n=1):
+        """Add a value; n = how many items it averages over (e.g. the batch size), for a weighted global average."""
         self.deque.append(value)
         self.count += n
         self.total += value * n
@@ -69,11 +71,13 @@ class SmoothedValue(object):
 
 
 class MetricLogger(object):
+    """A set of named SmoothedValues (loss, accuracy, lr, ...) that prints progress lines during an epoch."""
     def __init__(self, delimiter="\t"):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
 
     def update(self, **kwargs):
+        """Add one value per named metric, e.g. update(loss=0.4, class_acc=0.8); None values are skipped."""
         for k, v in kwargs.items():
             if v is None:
                 continue
@@ -83,6 +87,7 @@ class MetricLogger(object):
             self.meters[k].update(v)
 
     def __getattr__(self, attr):
+        # lets a meter be read as an attribute, e.g. metric_logger.loss
         if attr in self.meters:
             return self.meters[attr]
         if attr in self.__dict__:
@@ -102,6 +107,8 @@ class MetricLogger(object):
         self.meters[name] = meter
 
     def log_every(self, iterable, print_freq, header=None):
+        """Yield the items of iterable (e.g. a DataLoader) and print progress, ETA, timings and GPU memory every
+        print_freq items and at the end."""
         i = 0
         if not header:
             header = ''
@@ -149,6 +156,7 @@ class MetricLogger(object):
 
 
 class NativeScalerWithGradNormCount:
+    """AMP (mixed precision) loss scaler: does the backward pass and optimiser step, and returns the gradient norm."""
     state_dict_key = "amp_scaler"
 
     def __init__(self):
@@ -172,7 +180,7 @@ class NativeScalerWithGradNormCount:
 
 
 def get_grad_norm_(parameters) -> torch.Tensor:
-    # L2 norm of all gradients together
+    """L2 norm of all gradients together (logged as grad_norm to spot exploding gradients)."""
     parameters = [p for p in parameters if p.grad is not None]
     if len(parameters) == 0:
         return torch.tensor(0.)
@@ -180,7 +188,8 @@ def get_grad_norm_(parameters) -> torch.Tensor:
 
 
 def cosine_scheduler(base_value, final_value, epochs, niter_per_ep, warmup_epochs=0, start_warmup_value=0):
-    # one value per optimizer step: linear warmup start_warmup_value -> base_value, then cosine base_value -> final_value
+    """One value per optimiser step (epochs x niter_per_ep): linear warmup start_warmup_value -> base_value, then
+    cosine decay base_value -> final_value. Used for the learning rate."""
     warmup_schedule = np.array([])
     warmup_iters = warmup_epochs * niter_per_ep
     print("Set warmup steps = %d" % warmup_iters)
@@ -247,6 +256,7 @@ def auto_load_model(args, model, optimizer, loss_scaler):
 def load_trained_model(checkpoint_path, device):
     """
     Rebuild a trained model from its checkpoint for evaluation (predict.py, calibrate.py, visualise.py).
+    Written for this project (not in the original utils.py).
     The checkpoint stores the training arguments, so the model and its data (paths, input size, 2.5D input) are
     rebuilt exactly as trained. Returns (model in eval mode on `device`, training args).
     """

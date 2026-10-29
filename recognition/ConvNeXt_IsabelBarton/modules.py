@@ -1,11 +1,18 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+Model definitions: ConvNeXt (LayerNorm, as in the paper), ConvNeXtBN (BatchNorm + head dropout), the SimpleCNN
+baseline, the --model registry (MODELS) and build_model.
 
-# All rights reserved.
+References:
+    Block, ConvNeXt and LayerNorm are adapted from the official ConvNeXt implementation [2]
+    (Copyright (c) Meta Platforms, Inc. and affiliates, MIT licence):
+    https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
+    Z. Liu et al., "A ConvNet for the 2020s", CVPR 2022 [1]: https://arxiv.org/abs/2201.03545
+    BatchNorm variant motivated by https://github.com/hunghuynh1110/Alzheimers-MRI-ConvNext
+    ConvNeXt-Nano depths/dims from timm [21]: https://github.com/huggingface/pytorch-image-models
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-#https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
+AI assistance: BlockBN, ConvNeXtBN, convnext_nano_bn and SimpleCNN were scaffolded with Claude (Anthropic), then
+reviewed, trained and tested by me (see README, "Artificial Intelligence Usage Disclosure").
+"""
 
 import torch
 import torch.nn as nn
@@ -16,8 +23,8 @@ class Block(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
     (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
     (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
-    We use (2) as we find it slightly faster in PyTorch
-    
+    We use (2) as we find it slightly faster in PyTorch (comment from the original authors [2])
+
     Args:
         dim (int): Number of input channels.
         drop_path (float): Stochastic depth rate. Default: 0. (each block's rate is set from dp_rates in ConvNeXt)
@@ -42,6 +49,7 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity() # rate 0 -> Identity, so block is never skipped
 
     def forward(self, x):
+        """(N, C, H, W) -> (N, C, H, W): the block keeps the shape and adds a learned correction to its input."""
 
         input = x # keep a copy for the residual connection
 
@@ -130,6 +138,7 @@ class ConvNeXt(nn.Module):
         self.apply(self._init_weights) # runs _init_weights on every layer in the model (trained from scratch, so these are the starting weights)
 
     def _init_weights(self, m):
+        """Initial weights for one layer (called on every layer via self.apply)."""
 
         # only Conv2d/Linear; LayerNorms keep weight 1, bias 0 and gamma stays 1e-6
         if isinstance(m, (nn.Conv2d, nn.Linear)):
@@ -137,6 +146,8 @@ class ConvNeXt(nn.Module):
             nn.init.constant_(m.bias, 0)
 
     def forward_features(self, x):
+        """Stem + 4 stages + global average pooling + norm: (N, 3, 256, 256) -> pooled features (N, 768).
+        Also used by visualise.py for the UMAP plots."""
 
         for i in range(4):
             x = self.downsample_layers[i](x)
@@ -144,6 +155,7 @@ class ConvNeXt(nn.Module):
         return self.norm(x.mean([-2, -1])) # global average pooling, (N, C, H, W) -> (N, C)
 
     def forward(self, x):
+        """Images (N, 3, H, W) -> logits (N, num_classes); softmax of the logits gives the class probabilities."""
 
         x = self.forward_features(x)
         x = self.head_drop(x) # only active in model.train()
@@ -169,6 +181,7 @@ class LayerNorm(nn.Module):
         self.normalized_shape = (normalized_shape, )
     
     def forward(self, x):
+        """Normalise each pixel's channels to mean 0 / variance 1, then apply the learnable per-channel scale and shift."""
 
         if self.data_format == "channels_last": # (N, H, W, C), used inside each Block
             # built-in only normalises the LAST dim(s), so it works directly when channels are last
@@ -186,7 +199,7 @@ class LayerNorm(nn.Module):
 class BlockBN(nn.Module):
     r""" ConvNeXt Block with BatchNorm instead of LayerNorm, kept in (N, C, H, W) the whole way:
     DwConv -> BatchNorm2d -> 1x1 Conv -> GELU -> 1x1 Conv -> layer scale -> DropPath -> residual
-    (implementation (1) from Block above, with BN in place of channels_first LN)
+    (implementation (1) from Block above, with BN in place of channels_first LN). Added for this project.
 
     Args:
         dim (int): Number of input channels.
@@ -213,6 +226,7 @@ class BlockBN(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
+        """(N, C, H, W) -> (N, C, H, W); same steps as Block.forward, but with no permutes (channels_first throughout)."""
         input = x
         x = self.dwconv(x)
         x = self.norm(x)
@@ -278,18 +292,21 @@ class ConvNeXtBN(nn.Module):
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
+        """Initial weights for one layer (called on every layer via self.apply)."""
         # same as ConvNeXt; BatchNorms keep PyTorch's defaults (weight 1, bias 0)
         if isinstance(m, (nn.Conv2d, nn.Linear)):
             trunc_normal_(m.weight, std=.02)
             nn.init.constant_(m.bias, 0)
 
     def forward_features(self, x):
+        """Stem + 4 stages + global average pooling + BatchNorm1d: (N, 3, 256, 256) -> pooled features (N, 768)."""
         for i in range(4):
             x = self.downsample_layers[i](x)
             x = self.stages[i](x)
         return self.norm(x.mean([-2, -1])) # global average pooling, (N, C, H, W) -> (N, C)
 
     def forward(self, x):
+        """Images (N, 3, H, W) -> logits (N, num_classes)."""
         x = self.forward_features(x)
         x = self.head_drop(x) # only active in model.train(); model.eval() turns it off
         x = self.head(x)
@@ -332,9 +349,11 @@ class SimpleCNN(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward_features(self, x):
+        """4 conv blocks + global average pooling: (N, 3, 256, 256) -> pooled features (N, 256)."""
         return self.features(x).mean([-2, -1]) # global average pooling, (N, 256, 16, 16) -> (N, 256)
 
     def forward(self, x):
+        """Images (N, 3, H, W) -> logits (N, num_classes)."""
         return self.head(self.head_drop(self.forward_features(x)))
 
 
@@ -343,21 +362,26 @@ class SimpleCNN(nn.Module):
 # ---------------------------------------------------------------------------
 
 def convnext_tiny(**kwargs): #kwargs is the dictionary of initial arguments
+    """ConvNeXt-T as in the paper (LayerNorm), 27.8 M parameters."""
     # depths = how many ConvNeXt blocks each of the 4 stages has, dims = how many channels (feature maps) each stage has
     return ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs)
 
 def convnext_tiny_bn(**kwargs):
+    """ConvNeXt-T with BatchNorm and head dropout (the final model), 27.8 M parameters."""
     return ConvNeXtBN(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs) # same size as convnext_tiny, BN + head dropout
 
 def convnext_nano_bn(**kwargs):
+    """Smaller BatchNorm ConvNeXt (Nano), 15.0 M parameters, for the cost/benefit comparison."""
     # not in the ConvNeXt paper (it starts at Tiny): Nano's depths/dims from timm (R. Wightman, pytorch-image-models),
     # same blocks as Tiny, fewer and narrower: 15.0 M parameters vs 27.8 M
     return ConvNeXtBN(depths=[2, 2, 8, 2], dims=[80, 160, 320, 640], **kwargs)
 
 def simple_cnn(**kwargs):
+    """The baseline CNN for the open research dilemma, 0.39 M parameters."""
     return SimpleCNN(**kwargs)
 
-MODELS = {f.__name__: f for f in (convnext_tiny, convnext_tiny_bn, convnext_nano_bn, simple_cnn)}
+# --model name -> factory function, e.g. MODELS['convnext_tiny_bn'](num_classes=2)
+MODELS ={f.__name__: f for f in (convnext_tiny, convnext_tiny_bn, convnext_nano_bn, simple_cnn)}
 
 
 def build_model(args):

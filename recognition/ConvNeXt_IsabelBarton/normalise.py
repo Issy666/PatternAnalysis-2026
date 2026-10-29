@@ -1,5 +1,12 @@
 """
-Preprocessing: pad to square, training-set mean/std normalisation (cached) and the train / eval transforms.
+Preprocessing and augmentation: pad to square, training-set mean/std normalisation (cached in stats/) and the
+train / eval transforms.
+
+References:
+build_transform is adapted from the official ConvNeXt implementation [2] (Copyright (c) Meta Platforms, Inc. and
+affiliates, MIT licence): https://github.com/facebookresearch/ConvNeXt/blob/main/datasets.py
+The ImageNet augmentation (RandomResizedCrop, flips, RandAugment) was replaced with ADNI-specific augmentation.
+Random erasing: Z. Zhong et al., AAAI 2020 [20], via timm's RandomErasing [21].
 """
 import json
 from pathlib import Path
@@ -26,6 +33,7 @@ class PadToSquare:
         self.fill = fill
 
     def __call__(self, img: Image.Image) -> Image.Image:
+        """Return img centred on a black square canvas (unchanged if already square)."""
         w, h = img.size
         side = max(w, h)
         if w == h:
@@ -67,7 +75,7 @@ def compute_stats(
     # the cache records how images were preprocessed, so stats computed a different way are recomputed
     preprocess = f"pad_square_resize_{target_size}"
 
-    #have already calculated the mean and std for the training set, so we can cache it to avoid recalculating
+    # reuse the cached mean/std if they were computed the same way, to avoid re-reading every training image
     cache_path = Path(cache_dir) / f"{disease}_stats.json"
     if cache_path.exists():
         cached = _load_json(cache_path)
@@ -174,6 +182,7 @@ def build_transform(is_train,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_rgb_array(path: str, size: int) -> np.ndarray:
+    """Load an image as RGB, pad to square, resize to (size, size) and scale to [0, 1]: what the model sees."""
     with Image.open(path) as img:
         img = PadToSquare()(img.convert("RGB")).resize((size, size), Image.BILINEAR)
         arr = np.asarray(img, dtype=np.float64) / 255.0
@@ -181,5 +190,6 @@ def _load_rgb_array(path: str, size: int) -> np.ndarray:
 
 
 def _load_json(path) -> dict:
+    """Read a JSON file (the cached stats)."""
     with open(path) as f:
         return json.load(f)

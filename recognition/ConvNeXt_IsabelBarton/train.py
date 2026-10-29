@@ -1,11 +1,14 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""
+Training (AdamW, one epoch), evaluation and the AD/NC classification metrics. Called by main.py, which runs the
+epoch loop, saves checkpoints and tests the best model.
 
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-# Training (AdamW, one epoch), evaluation and the AD/NC classification metrics.
+References (official ConvNeXt implementation [2], Copyright (c) Meta Platforms, Inc. and affiliates, MIT licence):
+    train_one_epoch and evaluate are adapted from https://github.com/facebookresearch/ConvNeXt/blob/main/engine.py
+    get_parameter_groups / create_optimizer are simplified from
+    https://github.com/facebookresearch/ConvNeXt/blob/main/optim_factory.py
+    AdamW: I. Loshchilov and F. Hutter, "Decoupled weight decay regularization", ICLR 2019 [18]
+binary_metrics (AD/NC recall, precision, macro-F1) was written for this project.
+"""
 
 import math # math.isfinite: checks the loss isn't inf/NaN
 import torch
@@ -26,6 +29,7 @@ def get_parameter_groups(model, weight_decay):
 
 
 def create_optimizer(args, model):
+    """AdamW over the two parameter groups from get_parameter_groups."""
     # AdamW (the optimiser ConvNeXt was designed and tuned with): adaptive step size per weight + weight decay applied
     # separately from the gradient (the "W"). Weight decay is set per group above, so AdamW's own stays 0.
     # lr here is only the starting value; train_one_epoch sets it every step from the warmup + cosine schedule
@@ -34,7 +38,8 @@ def create_optimizer(args, model):
 
 def train_one_epoch(model, criterion, data_loader, optimizer, device, epoch, loss_scaler,
                     start_steps, lr_schedule_values, num_training_steps_per_epoch):
-    # trains the model for one pass over the training set; called once per epoch from main.py
+    """Train for one pass over the training set; returns the epoch's mean loss, accuracy, lr and gradient norm."""
+    # called once per epoch from main.py
     # always uses AMP (mixed precision), so training needs a CUDA GPU
     model.train(True) # training mode: DropPath/dropout on, BatchNorm uses batch statistics (model.eval() in evaluate)
     # running averages of loss/acc etc., printed every 10 batches to train.log

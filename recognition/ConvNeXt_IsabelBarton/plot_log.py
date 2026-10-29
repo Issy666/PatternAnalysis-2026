@@ -6,6 +6,9 @@ Plot training vs validation loss/accuracy (and validation AD/NC recall) from a r
 
 Saves training_curves.png and lr_schedule.png (learning rate per epoch: linear warmup, then cosine decay) in the
 run directory. Works while training is still going.
+
+AI assistance: the learning-rate plot was scaffolded with Claude (Anthropic), then reviewed by me (see README,
+"Artificial Intelligence Usage Disclosure").
 """
 
 import json
@@ -18,6 +21,7 @@ import matplotlib.pyplot as plt
 
 
 def main(run_dir):
+    """Read run_dir/log.txt and save the training-curve and learning-rate plots next to it."""
     run_dir = Path(run_dir).expanduser()
     rows = [json.loads(line) for line in open(run_dir / 'log.txt') if line.strip()]
     epochs = [r['epoch'] for r in rows]

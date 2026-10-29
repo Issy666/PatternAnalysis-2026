@@ -1,5 +1,5 @@
 """
-README figures that no other script makes, from a trained run:
+Makes the README figures that no other script makes, from a trained run:
 
   - example_input_output.png : the 3 neighbouring slices that form one 2.5D input, the normalised input, and the
                                model's P(AD) for each of the scan's 20 slices (a typical correctly classified AD scan)
@@ -9,7 +9,7 @@ README figures that no other script makes, from a trained run:
     python report_figures.py --run ... --cases 1005735:"A. Missed AD" 959645:"B. False alarm"
 
 Needs the run's checkpoint-best.pth and test_predictions.csv. Subject and year in the titles come from the split's
-split_manifest.csv (written by subject_datasplit.py), if it exists.
+split_manifest.csv (written by subject_datasplit.py), if it exists. Grad-CAM [13] comes from visualise.py.
 """
 import argparse
 import csv
@@ -53,6 +53,7 @@ def slice_bars(ax, probs):
 
 
 def main(args):
+    """Load the run's model, test set and predictions, then save example_input_output.png and failure_cases.png."""
     run = Path(args.run).expanduser()
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
@@ -74,13 +75,16 @@ def main(args):
         index[patient_id(p)][int(Path(p).stem.split('_')[1])] = i
 
     def scan_mean(scan):
+        # scan-level P(AD): mean over its slices
         return float(np.mean(list(slice_probs[scan].values())))
 
     def middle(scan):
+        # slice number of the scan's middle slice
         s = sorted(index[scan])
         return s[len(s) // 2]
 
     def describe(scan):
+        # figure title text: scan ID, plus subject and year if the split manifest is available
         m = manifest.get(scan)
         return f"scan {scan}, subject {m['subject']}, {m['year']}" if m else f"scan {scan}"
 

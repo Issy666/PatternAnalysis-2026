@@ -23,6 +23,13 @@ validation-chosen threshold, referral), otherwise the run's test_predictions.csv
 Usage:
     python visualise.py --resume ~/Desktop/results/<run>/checkpoint-best.pth
 Needs umap-learn for the UMAP plot (Grad-CAM works without it).
+
+References:
+    R. R. Selvaraju et al., "Grad-CAM: Visual explanations from deep networks via gradient-based localization",
+    ICCV 2017 [13]: https://arxiv.org/abs/1610.02391
+    L. McInnes, J. Healy and J. Melville, "UMAP", arXiv:1802.03426, 2018 [14]; umap-learn library
+AI assistance: this script was scaffolded with Claude (Anthropic), then reviewed, run and checked by me (see README,
+"Artificial Intelligence Usage Disclosure").
 """
 import argparse
 import csv
@@ -42,6 +49,7 @@ BLUE, ORANGE, INK, MUTED, GREY = '#2a78d6', '#eb6834', '#0b0b0b', '#898781', '#c
 
 
 def get_args_parser():
+    """Command-line options: the checkpoint, Grad-CAM stage, examples per row and brain-mask threshold."""
     p = argparse.ArgumentParser('Grad-CAM + UMAP on the test set')
     p.add_argument('--resume', required=True, help='checkpoint-best.pth of the run')
     p.add_argument('--output_dir', default='', help='default: <run>/visualise')
@@ -84,6 +92,7 @@ def scan_outcomes(run_dir):
 
 
 def outcome(o):
+    """Outcome group of a scan: 'Referred', 'Correct AD', 'Correct NC', 'Missed AD' or 'False alarm'."""
     if o['referred']:
         return 'Referred'
     if o['label'] == o['pred']:
@@ -104,6 +113,7 @@ def middle_slices(dataset):
 # ---------------------------------------------------------------------------
 
 def cam_layer(model, stage):
+    """The layer whose output feature maps Grad-CAM uses (end of `stage`), for ConvNeXt or the baseline CNN."""
     if hasattr(model, 'stages'):  # ConvNeXt / ConvNeXtBN
         return model.stages[stage - 1]
     return model.features[4 * stage - 1]  # SimpleCNN: output of block `stage` (after its max-pool)
@@ -149,6 +159,7 @@ def slice_image(x, mean, std):
 
 
 def run_gradcam(model, dataset, outcomes, middles, args, out):
+    """Grad-CAM on every test scan's middle slice: saves gradcam_stats.json, gradcam_examples.png and gradcam_mean.png."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -180,7 +191,8 @@ def run_gradcam(model, dataset, outcomes, middles, args, out):
         groups[outcome(outcomes[i])].append(i)
 
     def summary(sel):
-        fi, fa = np.mean([inside[i] for i in sel]), np.mean([area[i] for i in sel])
+        # mean share of heat map inside the brain vs mean brain area, over the scans in sel
+        fi, fa =np.mean([inside[i] for i in sel]), np.mean([area[i] for i in sel])
         return {'n': len(sel), 'mean_fraction_inside_brain': float(fi), 'mean_brain_area_fraction': float(fa),
                 'enrichment': float(fi / fa)}  # > 1 = the heat map favours the brain over the background
 
@@ -277,6 +289,7 @@ def slice_outcomes(run_dir):
 
 
 def plot_umap(emb, panels, title, path, point_size, alpha, seed=0):
+    """Scatter the 2D embedding once per panel; each panel is (title, {category: colour}, category per point)."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -306,6 +319,7 @@ def plot_umap(emb, panels, title, path, point_size, alpha, seed=0):
 
 
 def run_umap(model, dataset, outcomes, run_dir, args, out):
+    """UMAP of the pooled features, per scan and per slice: saves umap_test.png and umap_test_slices.png."""
     try:
         import umap
     except ImportError:
@@ -342,6 +356,7 @@ def run_umap(model, dataset, outcomes, run_dir, args, out):
 
 
 def main(args):
+    """Rebuild the model and test set from the checkpoint, load each scan's outcome, then run Grad-CAM and UMAP."""
     torch.manual_seed(args.seed)
     run_dir = Path(args.resume).expanduser().resolve().parent
     out = Path(args.output_dir) if args.output_dir else run_dir / 'visualise'

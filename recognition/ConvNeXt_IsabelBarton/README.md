@@ -2,9 +2,9 @@
 
 **COMP3710 Project 2.1 (Classification) · ConvNeXt · Hard difficulty** · Isabel Barton
 
-Summary: A PyTorch ConvNeXt that classifies T1-weighted structural brain MRI slices from the ADNI dataset as **Alzheimer's disease (AD)** or **cognitively normal (NC)**. The final classification combines each scan's 20 MRI slices into one classification, and studies the question: *does the convnext model know when it is unsure or overconfident?*
+Summary: A PyTorch ConvNeXt that classifies T1-weighted structural brain MRI slices from the ADNI dataset as **Alzheimer's disease (AD)** or **cognitively normal (NC)**. The final classification combines each scan's 20 MRI slices into one classification, and studies the question: *does the ConvNeXt model know when it is unsure, or is it overconfident?*
 
-The final ConvNeXt- Tiny model reaches **80.5% patient-level test accuracy**, with AD recall above NC recall, calibrated confidence and a referral rule that sends ~17% of scans to a specialist to verify (scans the model is not confident in). A plain CNN with 70x less paramters as a baseline performs as well on the same split with 82.7% test accuracy with no dataset/paramater fine tuning.
+The final ConvNeXt-Tiny model reaches **80.5% patient-level test accuracy**, with AD recall above NC recall, calibrated confidence and a referral rule that sends ~17% of scans to a specialist to verify (scans the model is not confident in). A plain baseline CNN with 70x fewer parameters performs as well on the same split, reaching 82.7% test accuracy without any dataset or parameter fine-tuning.
 
 Therefore, the main engineering recommendation is that ConvNeXt's extra cost is not justified for this data.
 
@@ -14,13 +14,13 @@ Therefore, the main engineering recommendation is that ConvNeXt's extra cost is 
 
 ### 1.1 The problem
 
-Alzheimer's disease causes irreversible neurodegeneration that shows on structural MRI's as hippocampal and cortical atrophy and enlarged ventricles. An automated classifier that labels T1-weighted scans as AD or NC could support screening, but only if it is accurate on *new* patients (e.g. a test set) and, in if its confidence can be trusted (e.g. a confident missed AD case is far worse than a false alarm). The difficulties are natural variation in head shape and age between people, subtle differences between early AD and normal ageing.
+Alzheimer's disease causes irreversible neurodegeneration that shows on structural MRIs as hippocampal and cortical atrophy and enlarged ventricles. An automated classifier that labels T1-weighted scans as AD or NC could support screening, but only if it is accurate on *new* patients (e.g. a test set) and if its confidence can be trusted (e.g. a confident missed AD case is far worse than a false alarm). The difficulties are natural variation in head shape and age between people, and the subtle differences between early AD and normal ageing.
 
-The task is binary classification of 2D sagittal slices (256 × 240 greyscale, 20 consecutive slices per scan) from a ADNI data subset [3], with a target of **≥ 0.80 test accuracy**.
+The task is binary classification of 2D sagittal slices (256 × 240 greyscale, 20 consecutive slices per scan) from an ADNI data subset [3], with a target of **≥ 0.80 test accuracy**.
 
 ### 1.2 The algorithm: ConvNeXt
 
-ConvNeXt [1] is a pure convolutional network which has been modified from a ResNet to mimic similar properties from vision Transformers. Vision Transformers are often seen as the modern state of the art in computer vision. However, ConvNeXt-T matched Swin-T on the ImageNet dataset (82.1% vs 81.3%) at similar compute in paper [1]. ConvNeXt mimics vision Transformers in the following ways:
+ConvNeXt [1] is a pure convolutional network that was modified from a ResNet to mimic properties of vision Transformers. Vision Transformers are often seen as the modern state of the art in computer vision. However, ConvNeXt-T matched Swin-T on the ImageNet dataset (82.1% vs 81.3%) at similar compute [1]. ConvNeXt mimics vision Transformers in the following ways:
 
 - **Stage compute ratio:** blocks per stage changed from ResNet's (3, 4, 6, 3) to (3, 3, 9, 3), matching Swin's 1:1:3:1 ratio.
 - **Patchify stem:** a 4×4, stride-4 non-overlapping convolution replaces ResNet's 7×7 conv and max-pool, like the patch embedding of ViT/Swin.
@@ -28,7 +28,7 @@ ConvNeXt [1] is a pure convolutional network which has been modified from a ResN
 - **Large kernels:** the depthwise convolution is moved to the start of the block (as self-attention comes before the MLP) and enlarged to 7×7, matching Swin's 7×7 attention windows.
 - **Fewer activations and normalisations:** GELU replaces ReLU, with only one activation and one normalisation per block, as in a Transformer block.
 
-My ConvNeXt is based on the model in [1], and the code was cloned from and then modified from the official implementation [2]. The model as developed in `modules.py` is depicted in Figure 1 below.
+My ConvNeXt is based on the model in [1], and the code was cloned from the official implementation [2] and then modified. The model as developed in `modules.py` is depicted in Figure 1 below.
 
 ![ConvNeXt-T architecture as used in this project](images/convnext_architecture.png)
 
@@ -38,22 +38,22 @@ My ConvNeXt is based on the model in [1], and the code was cloned from and then 
 
 *Figure 2. A ConvNeXt block: a large-kernel depthwise convolution mixes space, an inverted-bottleneck (1×1 convs, expansion ×4, one GELU) mixes channels, and the residual branch is scaled by a learnable per-channel value and randomly dropped during training.*
 
-**How it works.** Each MRI slice is padded from 256 x 244 to 256 × 256 and the rgb channels are instead two neighbouring slices as the three input channels. The **patchify stem** turns non-overlapping 4 × 4 pixel patches into 96-channel features. Four **stages** of ConvNeXt blocks (3, 3, 9, 3 blocks) build a feature hierarchy, from edges and boundaries in stage 1 to more complex structures in stages 3-4, while strided 2 × 2 convolutions halve the resolution between stages (64 -> 32 -> 16 -> 8). Global average pooling gives one 768-dimensional vector per slice, and a linear head outputs the logits for AD and NC. Softmax then outputs the classification perr slice proberbility. A scan's diagnosis is the mean P(AD) over its 20 slices, optionally scaled and compared with a threshold, and scans whose probability lies close to the threshold are referred to a specialist.
+**How it works.** Each MRI slice is padded from 256 × 240 to 256 × 256, and instead of RGB, the three input channels are the slice and its two neighbouring slices. The **patchify stem** turns non-overlapping 4 × 4 pixel patches into 96-channel features. Four **stages** of ConvNeXt blocks (3, 3, 9, 3 blocks) build a feature hierarchy, from edges and boundaries in stage 1 to more complex structures in stages 3-4, while strided 2 × 2 convolutions halve the resolution between stages (64 -> 32 -> 16 -> 8). Global average pooling gives one 768-dimensional vector per slice, and a linear head outputs the logits for AD and NC. Softmax then converts these logits into a probability for each slice. A scan's diagnosis is the mean P(AD) over its 20 slices, optionally scaled and compared with a threshold, and scans whose probability lies close to the threshold are referred to a specialist.
 
 **Changes from the paper and original git repo**:
 
 | Component | ConvNeXt paper [1] | This project | Why |
 |---|---|---|---|
-| Normalisation | LayerNorm | **BatchNorm** [15] (`convnext_tiny_bn`); LayerNorm kept as `convnext_tiny` | BatchNorm trained from scratch faster and more accurately (Section 5.1),. Paer [1] also only had  a LayerNorm gain of +0.1% on ImageNet|
+| Normalisation | LayerNorm | **BatchNorm** [15] (`convnext_tiny_bn`); LayerNorm kept as `convnext_tiny` | BatchNorm trained from scratch faster and more accurately (Section 5.1). The paper [1] also only reported a +0.1% gain from LayerNorm on ImageNet |
 | Classifier head | LayerNorm -> linear | BatchNorm1d -> **dropout 0.4** -> linear | extra regularisation against early overfitting |
-| Input | RGB image | slices n−1, n, n+1 as the 3 channels (`dataset.NeighbourSliceFolder`) | atrophy is a 3D change; the paper's 3 channels would otherwise hold 3 copies of one slice. THis change resulted in +3.9 accuracy points (Section 5.1) |
+| Input | RGB image | slices n−1, n, n+1 as the 3 channels (`dataset.NeighbourSliceFolder`) | atrophy is a 3D change; the paper's 3 channels would otherwise hold 3 copies of one slice. This change resulted in +3.9 accuracy points (Section 5.1) |
 | Initialisation | Pretrained ImageNet training, 300 epochs | **from scratch**, 18 epochs | |
-| Sizes | Tiny and up | Tiny (27.8 M paramaters) and **Nano** (15.0 M Paramaters) | size benefit comparison |
+| Sizes | Tiny and up | Tiny (27.8 M parameters) and **Nano** (15.0 M parameters) | size benefit comparison |
 | Augmentation | RandAugment, Mixup, CutMix, flips | small rotations, intensity jitter, random erasing | keep the anatomy and label of each slice intact (Section 3.4) |
 
 The implementation follows the official ConvNeXt code [2] (blocks, drop path, layer scale, AdamW parameter groups, schedules), adapted for ADNI with reference to other ADNI ConvNeXt code [4], [6]; sources are also cited in the code.
 
-The **baseline** (`simple_cnn`) is a plain CNN with: four blocks of 3 × 3 conv -> BatchNorm -> ReLU -> 2 × 2 max-pool (32–256 channels), global average pooling, dropout 0.4 and a linear head equating to 0.39 M parameters.
+The **baseline** (`simple_cnn`) is a plain CNN with four blocks of 3 × 3 conv -> BatchNorm -> ReLU -> 2 × 2 max-pool (32–256 channels), global average pooling, dropout 0.4 and a linear head, totalling 0.39 M parameters.
 
 ---
 
@@ -87,7 +87,7 @@ The **baseline** (`simple_cnn`) is a plain CNN with: four blocks of 3 × 3 conv 
 | Best validation accuracy | 92.8% (epoch 9) | AD / CN recall (estimated) | 57% / 94% |
 | Parameters | 27.8 M | CPU inference (128²) | 39 ms per slice |
 
-The pipeline works end to end (validation loss 0.42 -> 0.20). Test accuracy is below target with a large validation–test gap, and most errors are missed AD (against the acceptence criteria 2). Grad-CAM often highlights the ventricles and medial temporal lobe, but sometimes the border (possible shortcut).
+The pipeline works end to end (validation loss 0.42 -> 0.20). Test accuracy is below target with a large validation–test gap, and most errors are missed AD (failing acceptance criterion 2). Grad-CAM often highlights the ventricles and medial temporal lobe, but sometimes the border (possible shortcut).
 
 ### 4. Risks, Budget & Fallback
 - **Risks -> mitigations:** 
@@ -118,11 +118,11 @@ ADNI_068_S_0473_MR_Accelerated_Sagittal_MPRAGE__br_raw_20171116173455030_..._I93
 
 The 1,525 scans come from only **680 people** (221 AD, 459 NC), many scanned at several visits (up to 8 scans). The course's train/test split and any split by filename ID therefore put the same people in more than one split: **216 people** are in both the course training folder and test, and 95% of the AD scans in a filename-ID validation split (74 of 78) belonged to people also in training.
 
-On NC, people seen in training scored 0.99 and new people 0.88. The model largely recognising **people** rather than disease.
+On NC, people seen in training scored 0.99 and new people 0.88. The model was largely recognising **people** rather than disease.
 
 ### 3.3 Leakage-free subject-level split
 
-`subject_datasplit.py` re-splits all 1,525 scans **by ADNI subject**, so no person appears in more than one split. The final train/validate/test split 60/ 10 / 30% was:
+`subject_datasplit.py` re-splits all 1,525 scans **by ADNI subject**, so no person appears in more than one split. The final train/validation/test split (60/10/30%) was:
 
 | Split | Class | Scans | Slices |
 |---|---|---|---|
@@ -142,7 +142,7 @@ On NC, people seen in training scored 0.99 and new people 0.88. The model largel
 | **Validation − test gap** | **16.6 points** | **6.1 points** |
 | Test patient AD / NC recall | **0.42 / 0.96** | **0.75 / 0.69** |
 
-Removing the leak made validation more honest and the gap shrank from 17 to 6 points and removed the strong NC bias. All results below use this split.
+Removing the leak made validation more honest: the gap shrank from 17 to 6 points, and the strong NC bias disappeared. All results below use this split.
 
 ### 3.4 Pre-processing and augmentation
 
@@ -152,7 +152,7 @@ All transforms are in `normalise.py`; the dataset classes are in `dataset.py`.
 |---|---|---|---|
 | Pad to square (`PadToSquare`) | Y | Y | 256 × 240 -> 256 × 256 with black rows; this way the brain is never stretched |
 | 3 channels | Y | Y | neighbouring slices n−1, n, n+1 of the same scan as R, G, B; edge slices repeat themselves; no data crosses splits |
-| Random alterations | ±15°, shift ±8%, zoom ±10% | N | head tilt, position and size differences between people (age, genser) and scanners |
+| Random alterations | ±15°, shift ±8%, zoom ±10% | N | head tilt, position and size differences between people (age, gender) and scanners |
 | Brightness / contrast | ±30% | N | scanner and acquisition intensity differences |
 | Normalise | Y | Y | mean 0.1085, std 0.2197 computed on the **training split only** and cached in `stats/` |
 | Random erasing [20] | p = 0.25, one noise-filled rectangle | N | occlusion robustness, as in ConvNeXt [1] |
@@ -168,11 +168,11 @@ All transforms are in `normalise.py`; the dataset classes are in `dataset.py`.
 | Setting | Final value | Reason |
 |---|---|---|
 | Optimiser | AdamW [18] with weight decay 0.05 | ConvNeXt's optimiser and decay [1]. Weight decay shrinks weights towards 0 each step to reduce overfitting. |
-| Learning rate | 5e-4 peak, 3-epoch linear warmup, cosine decay to 1e-6 | initial high learning rate with peaks and then decays overtime as exploration becomes less important |
-| Epochs | **18** | validation loss is converges at around epoch 10 in every run, so the cosine decay is made to finish there |
+| Learning rate | 5e-4 peak, 3-epoch linear warmup, cosine decay to 1e-6 | the learning rate ramps up to a peak, then decays over time as exploration becomes less important |
+| Epochs | **18** | validation loss converges at around epoch 10 in every run, so the cosine decay is made to finish there |
 | Batch size | 64 (285 steps/epoch) | fits the RTX 3080; stable BatchNorm statistics |
 | Loss | cross-entropy, label smoothing 0.1 [10] | paper's setting; discourages over-confidence |
-| Regularisation | drop path 0.3, head dropout 0.4, augmentation (3.4) | the 28 M-parameter model overfits ~400 people quickly so this attempts to reduce overftting|
+| Regularisation | drop path 0.3, head dropout 0.4, augmentation (3.4) | the 28 M-parameter model overfits ~400 people quickly so this attempts to reduce overfitting |
 | Checkpoint selection | best **patient-level validation macro-F1** |  |
 
 ![Training and validation curves of the final model](images/training_curves_final.png)
@@ -209,9 +209,9 @@ All numbers are on the **subject-level test set** (462 scans from 210 people) un
 
 ### 5.2 Final model
 
-The final model is **BatchNorm ConvNeXt-T with extra dimensions via neighbouring channels on input and the 18-epochs**. 
+The final model is **BatchNorm ConvNeXt-T with extra dimensions via neighbouring channels on input, trained for 18 epochs**.
 
-3 tests with the final model:
+Results of three runs (seeds) of the final model:
 
 | Seed | Slice acc. | Slice AUROC | **Patient acc.** | Patient AUROC | AD / NC recall | Macro-F1 |
 |---|---|---|---|---|---|---|
@@ -244,7 +244,7 @@ The final model is **BatchNorm ConvNeXt-T with extra dimensions via neighbouring
 
 *Does the model reliably quantify uncertainty on ambiguous cases compared to a simple baseline, or does it stay overconfident when wrong? What confidence threshold or reject rule safely automates confident cases and routes the rest to specialists, and does ConvNeXt's extra cost justify itself?*
 
-Everything below compares ConvNeXt-T with the baseline CNN trained with the identical data split, 3 channel dimensions, augmentation, optimiser, schedule and checkpoint rule, only the architecture differs. 
+Everything below compares ConvNeXt-T with the baseline CNN trained with the identical data split, 3 channel dimensions, augmentation, optimiser, schedule and checkpoint rule; only the architecture differs.
 
 ### 6.1 Quantitative benchmarking
 
@@ -266,7 +266,7 @@ Calibration is measured with the expected calibration error (ECE, 10 bins over [
 
 **Temperature scaling** [12] divides the logits by a value T fitted on the **validation** set minimising the spread. It never changes a slice's predicted class. 
 
-The decision threshold and a **referral band** (refer a scan if its P(AD) is within ±b of the threshold, with b set so that 20% of validation scans are referred, then everything is applied once to test (`calibrate.py`).
+The decision threshold and a **referral band** (refer a scan if its P(AD) is within ±b of the threshold, with b set so that 20% of validation scans are referred) are chosen on validation, then applied once to test (`calibrate.py`).
 
 | Test, patient level | Baseline CNN | ConvNeXt-T seed 0 | ConvNeXt-T 3 seeds | ConvNeXt-Nano | ConvNeXt-T LayerNorm |
 |---|---|---|---|---|---|
@@ -315,9 +315,9 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 | Case | Scan (subject, year) | Truth -> prediction | What happened | Root cause (diagnosis) |
 |---|---|---|---|---|
-| **A. Confident missed AD** | `1005735` (`003_S_6264`, 2018) | AD -> NC, P(AD) 0.14 | every slice below 0.31; the same person's 2019 scan is also missed P(AD) (0.27) | **person-level appearance**: this person's brain looks NC-like to the model on every slice and visit, consistent with mild or early-stage atrophy. Grad-CAM appears to look at relevant locations on the brain. So there was plausible anatomy that did not look abnormal |
+| **A. Confident missed AD** | `1005735` (`003_S_6264`, 2018) | AD -> NC, P(AD) 0.14 | every slice below 0.31; the same person's 2019 scan is also missed (P(AD) 0.27) | **person-level appearance**: this person's brain looks NC-like to the model on every slice and visit, consistent with mild or early-stage atrophy. Grad-CAM appears to look at relevant locations on the brain, so the model attended to plausible anatomy that did not look abnormal |
 | **B. Confident false alarm** | `959645` (`041_S_6192`, 2018) | NC -> AD, P(AD) 0.87 | 18 of 20 slices called AD; the second scan from the same session (`959644`) gives the same 0.87 | Grad-CAM peaks at the edge of the brain and partly outside it, the same hot spot as correct AD predictions (Figure 13). This might indicate some sort of shortcut (correlated boundary detection with AD) rather than AD symptoms |
-| **C. Repeated false alarm** | `1070417` (`068_S_0127`, 2018) | NC -> AD, P(AD) 0.86 | all 3 of this person's test scans are false alarms | Anatomy looks AD-like, plausibly age-related atrophy; age is not in the metadata, so this cannot be confirmed. Across the test set, 18 of 71 NC people with several scans have every scan flagged (Shortcut = multiple scans could mean likley to have AD, if people with AD usually got multiple scans)|
+| **C. Repeated false alarm** | `1070417` (`068_S_0127`, 2018) | NC -> AD, P(AD) 0.86 | all 3 of this person's test scans are false alarms | Anatomy looks AD-like, plausibly age-related atrophy; age is not in the metadata, so this cannot be confirmed. Across the test set, 18 of 71 NC people with several scans have every scan flagged (possible shortcut: if people with AD usually had multiple scans, having several scans could itself be associated with AD) |
 | **D. Borderline, correctly referred** | `301063` (`126_S_4494`, 2012) | AD -> NC, P(AD) 0.50 | central slices 0.75–0.90 (AD), outer slices 0.05–0.45 (NC); the mean lands on the boundary | **slice disagreement**: the evidence is in the central slices only; the scan-level mean dilutes it. The referral rule correctly sends this case to a specialist |
 
 ![Grad-CAM examples per outcome](images/gradcam_examples.png)
@@ -326,7 +326,7 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 ![Mean Grad-CAM per outcome](images/gradcam_mean.png)
 
-*Figure 13. Mean Grad-CAM per outcome. Correct AD and false alarms share the same frontal hot spot; correct NC predictions focus more centrally*
+*Figure 13. Mean Grad-CAM per outcome. Correct AD and false alarms share the same frontal hot spot; correct NC predictions focus more centrally.*
 
 **Grad-CAM statistics** (`visualise.py`): on average 47% of each heat map lies inside the (filled) brain outline, which covers 24% of the image. Part of the "outside" mass is the 16 × 16-pixel resolution of stage-3 maps bleeding over the brain edge, but the shared frontal hot spot of correct and false AD calls suggests the model also uses the brain's outline. Referred scans have the least focused maps (37% inside).
 
@@ -338,16 +338,16 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 *Figure 15. The same features per slice: a continuous horseshoe from AD-like to NC-like slices with a mixed band where most slice errors fall; averaging 20 slices per scan sharpens the separation (slice accuracy 76.1% -> scan accuracy 80.5%).*
 
-**Summary of failure modes.** Errors are **person-level** rather than random: a person whose anatomy the model finds AD-like (or NC-like) is misclassified on every slice and every visit, and these errors are confident, so they are not reffered. Slice-level disagreement causes the borderline cases, which the referral rule does catch.
+**Summary of failure modes.** Errors are **person-level** rather than random: a person whose anatomy the model finds AD-like (or NC-like) is misclassified on every slice and every visit, and these errors are confident, so they are not referred. Slice-level disagreement causes the borderline cases, which the referral rule does catch.
 
 ### 6.5 Engineering recommendation
 
-My engineering reccomendations are based on this models performance:
+My engineering recommendations, based on this model's performance, are:
 
-1. **Use the plain CNN, not ConvNeXt, on data of this size.** The 0.39 M-parameter baseline matched ConvNeXt-T in accuracy (82.7% vs 79.4%, not significantly different), calibration and referral performance, at 1/70 th of the parameters, ~1/4 of the training time and ~1/6 of the latency.
+1. **Use the plain CNN, not ConvNeXt, on data of this size.** The 0.39 M-parameter baseline matched ConvNeXt-T in accuracy (82.7% vs 79.4%, not significantly different), calibration and referral performance, at 1/70th of the parameters, ~1/4 of the training time and ~1/6 of the latency.
 2. **Decide per scan, not per slice**, by averaging the 20 slices: +3-6 points accuracy and higher AUROC for every model.
-4. **Operating rule:** automate scans whose calibrated P(AD) is outside ±0.13 of the threshold and refer the rest. On test this referred **16.7%** of ConvNeXt's scans and raised accuracy from 77.9% to **83.4%**, with **AD recall 0.96**. The baseline under the same rule: 13.9% referred, 87.4% accuracy.
-5. **Do not rely on confidence alone for safety.** About half of the errors are confident and person-specific (cases A–C). Add an input-quality / out-of-distribution check and a secondary system to detect positive cases.
+3. **Operating rule:** automate scans whose calibrated P(AD) is outside ±0.13 of the threshold and refer the rest. On test this referred **16.7%** of ConvNeXt's scans and raised accuracy from 77.9% to **83.4%**, with **AD recall 0.96**. The baseline under the same rule: 13.9% referred, 87.4% accuracy.
+4. **Do not rely on confidence alone for safety.** About half of the errors are confident and person-specific (cases A–C). Add an input-quality / out-of-distribution check and a secondary system to detect positive cases.
 
 ---
 
@@ -363,7 +363,7 @@ My engineering reccomendations are based on this models performance:
 | `train.py` | AdamW optimiser, `train_one_epoch`, `evaluate`, AD/NC metrics |
 | `main.py` | training entry point: trains, validates every epoch, saves checkpoints, tests the best checkpoint |
 | `predict.py` | runs a trained checkpoint on the test set or analyses saved predictions: patient-level metrics, confusion matrix, ROC, calibration, reject curve, example predictions |
-| `calibrate.py` | temperature scaling, validation-chosen threshold and referral rule
+| `calibrate.py` | temperature scaling, validation-chosen threshold and referral rule |
 | `visualise.py` | Grad-CAM and UMAP plots |
 | `utils.py` | logging, learning-rate schedule, checkpoint saving/resuming/loading |
 | `run_pipeline.sh` | one complete run: data check -> training -> test -> analysis -> plots |
@@ -457,13 +457,13 @@ pip install timm==1.0.30 numpy==2.5.4 pillow==13.0.0 matplotlib==3.11.2 umap-lea
 - **Tool used:** Claude (Anthropic), through the Claude Code command-line assistant.
 - **What it assisted with:**
   - comparing this implementation with a public reference implementation [2] and with Basereh et al. [5];
-  - scaffolding and refactoring code: the BatchNorm ConvNeXt variant, the 3 channel neighbours, the smaller ConvNeXt sizes and baseline CNN=, `calibrate.py` (temperature scaling, threshold and referral rule), `visualise.py` (Grad-CAM, UMAP), the confusion-matrix/ROC/learning-rate plots, and a final code clean-up;
-  - analysis scripts: the patient-leakage investigation from the ADNI metadata.
-  - Restructuring and formatting this README and condensing the feasibility review.
+  - scaffolding and refactoring code: the BatchNorm ConvNeXt variant, the 3-channel neighbouring-slice input, the smaller ConvNeXt sizes and the baseline CNN, `calibrate.py` (temperature scaling, threshold and referral rule), `visualise.py` (Grad-CAM, UMAP), the confusion-matrix/ROC/learning-rate plots, and a final code clean-up;
+  - analysis scripts: the patient-leakage investigation from the ADNI metadata;
+  - restructuring and formatting this README and condensing the feasibility review.
 - **How it was audited and verified:**
   - every experiment was run by me on my own GPU, and every number in this report was read from the run's own output files (`test_results.json`, `log.txt`, `calibration_results.json`);
-  - After a code clean-up every script was verified visually and by running it and compared with the before and after outputs.
-  - Verified claims by reading academic litreture and reading [1] in depth to fully understand what is required of a convNeXt model. 
+  - after the code clean-up, every script was re-run, its outputs were checked visually, and they were compared with the outputs from before the clean-up;
+  - claims were verified against the academic literature, and [1] was read in depth to fully understand what a ConvNeXt model requires.
 
 ---
 

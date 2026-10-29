@@ -1,11 +1,17 @@
 """
-Test a trained ConvNeXt and analyse its predictions.
+Test a trained model and analyse its predictions: patient-level metrics, confusion matrix, ROC/AUC, calibration
+(ECE, reliability diagram), reject curve and example predictions.
 
 Two ways to run it:
   1. From a checkpoint (runs the model on the test set, then analyses):
        python predict.py --resume ~/Desktop/results/<run>/checkpoint-best.pth
   2. From an existing test_predictions.csv (no model or GPU needed):
        python predict.py --predictions ~/Desktop/results/<run>/test_predictions.csv
+
+References: calibration / ECE follow C. Guo et al., "On calibration of modern neural networks", ICML 2017 [12].
+AI assistance: the confusion-matrix and ROC plots (plot_confusion, roc_curve, plot_roc) were scaffolded with
+Claude (Anthropic), then reviewed and checked against the run outputs by me (see README, "Artificial Intelligence
+Usage Disclosure").
 """
 import argparse
 import csv
@@ -113,6 +119,7 @@ def save_patient_results(patients, metrics, threshold, output_dir):
 
 
 def print_metrics(title, m):
+    """Print accuracy, per-class recall, macro-F1 and the confusion counts from classification_metrics."""
     print(f"\n{title}")
     print(f"  accuracy {m['acc1']:.2f}%   AD recall {m['ad_recall']:.3f}   NC recall {m['nc_recall']:.3f}   "
           f"macro-F1 {m['macro_f1']:.3f}")
@@ -261,6 +268,7 @@ def calibration(prob_ad, labels, n_bins=10):
 
 
 def print_calibration(title, c):
+    """Print ECE, MCE and the mean confidence on correct vs wrong predictions from calibration()."""
     print(f"\n{title}")
     print(f"  ECE {c['ece']:.4f}   MCE {c['mce']:.4f}   accuracy {c['accuracy']:.3f}   "
           f"mean confidence {c['mean_confidence']:.3f}")
@@ -335,6 +343,7 @@ def reject_curve(prob_ad, labels, max_reject=0.5, step=0.01, target=0.2):
     by_oracle = sorted(items, key=lambda x: (x['correct'], x['conf'])) # wrong ones first
 
     def kept_metrics(ranked, n_reject):
+        # metrics on the items left after referring the first n_reject of the ranking
         kept = ranked[n_reject:]
         m = classification_metrics(kept)
         return {'accuracy': m['acc1'] / 100, 'ad_recall': m['ad_recall'], 'nc_recall': m['nc_recall']}
@@ -363,6 +372,7 @@ def reject_curve(prob_ad, labels, max_reject=0.5, step=0.01, target=0.2):
 
 
 def print_reject(title, r):
+    """Print accuracy with no referral and at the target referral rate, from reject_curve()."""
     t = r['at_target']
     print(f"\n{title}")
     print(f"  no rejection: accuracy {r['accuracy_no_reject']:.3f}")
@@ -427,6 +437,7 @@ def pick_examples(slices, per_row=4, reject_rate=0.2, seed=0):
     cutoff = sorted(x['conf'] for x in items)[int(reject_rate * len(items))]
 
     def distinct(candidates):
+        # first per_row candidates, at most one per patient
         seen, out = set(), []
         for x in candidates:
             if x['patient'] not in seen:
@@ -457,6 +468,7 @@ def pick_examples(slices, per_row=4, reject_rate=0.2, seed=0):
 
 
 def print_examples(examples, cutoff):
+    """Print the slices chosen by pick_examples, one block per outcome."""
     print(f"\nExample predictions (referral cut-off: confidence < {cutoff:.3f})")
     for row, xs in examples.items():
         print(f"  {row}")
@@ -505,6 +517,7 @@ def plot_examples(examples, cutoff, path):
 # ---------------------------------------------------------------------------
 
 def get_args_parser():
+    """Command-line options: --resume or --predictions, threshold, calibration bins and referral rate."""
     parser = argparse.ArgumentParser('ConvNeXt test + analysis script')
     parser.add_argument('--resume', default='', type=str,
                         help='checkpoint to run on its test set (model and data are rebuilt from its saved arguments)')
@@ -527,6 +540,7 @@ def get_args_parser():
 
 
 def main(args):
+    """Get test predictions (run the checkpoint or read the CSV), then compute and save every metric and plot."""
     if args.predictions:
         # mode 2: analyse an existing CSV, no model needed
         csv_path = args.predictions

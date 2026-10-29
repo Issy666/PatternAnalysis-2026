@@ -19,6 +19,11 @@ which main.py writes from the same checkpoint-best.pth.
 Usage:
     python calibrate.py --resume ~/Desktop/results/<run>/checkpoint-best.pth
     python calibrate.py --resume ... --threshold_rule min_ad_recall --min_ad_recall 0.9
+
+Reference: C. Guo, G. Pleiss, Y. Sun and K. Q. Weinberger, "On calibration of modern neural networks", ICML 2017
+[12]: https://arxiv.org/abs/1706.04599
+AI assistance: this script was scaffolded with Claude (Anthropic), then reviewed, run and checked by me (see README,
+"Artificial Intelligence Usage Disclosure").
 """
 import argparse
 import csv
@@ -37,6 +42,7 @@ EPS = 1e-6  # predictions are stored with 6 decimals, so P(AD) is clamped to [1e
 
 
 def get_args_parser():
+    """Command-line options: the checkpoint, how to fit T, the threshold rule and the referral rate."""
     p = argparse.ArgumentParser('Temperature scaling + validation-chosen threshold and reject rule')
     p.add_argument('--resume', required=True, help='checkpoint-best.pth of the run to calibrate')
     p.add_argument('--test_predictions', default='',
@@ -100,6 +106,7 @@ def load_slices(csv_path):
 
 
 def scaled_probs(logits, T):
+    """Temperature-scaled P(AD) = sigmoid(logit / T)."""
     return 1 / (1 + np.exp(-logits / T))
 
 
@@ -115,7 +122,8 @@ def to_patients(pids, labels, slice_probs):
 
 
 def nll(labels, prob_ad):
-    p_true = np.where(labels == 'AD', prob_ad, 1 - prob_ad)
+    """Mean negative log-likelihood of the true labels (lower = better probabilities)."""
+    p_true = np.where(labels == 'AD', prob_ad, 1 - prob_ad) # probability given to the true class
     return float(-np.mean(np.log(np.clip(p_true, EPS, 1))))
 
 
@@ -127,6 +135,7 @@ def fit_temperature(pids, labels, logits, level):
     """Grid search over T (0.25 to 10, log-spaced): the T with the lowest validation NLL."""
     grid = np.exp(np.linspace(np.log(0.25), np.log(10), 400))
     def loss(T):
+        # validation NLL at temperature T, at patient level (mean of slices) or slice level
         p = scaled_probs(logits, T)
         if level == 'patient':
             _, pl, pp = to_patients(pids, labels, p)
@@ -140,7 +149,8 @@ def fit_temperature(pids, labels, logits, level):
 
 
 def metrics_at(labels, prob_ad, t, keep=None):
-    keep = np.ones(len(labels), bool) if keep is None else keep
+    """Classification metrics when predicting AD for P(AD) > t, optionally only on the rows where keep is True."""
+    keep =np.ones(len(labels), bool) if keep is None else keep
     rows = [{'label': l, 'pred': 'AD' if p > t else 'NC'} for l, p in zip(labels[keep], prob_ad[keep])]
     return classification_metrics(rows)
 
@@ -173,6 +183,7 @@ def choose_reject_band(prob_ad, t, rate):
 # ---------------------------------------------------------------------------
 
 def summarise(name, labels, prob_ad, t, slice_labels, slice_probs, n_bins, band=None):
+    """One results row: accuracy, recalls, macro-F1, NLL and ECE at threshold t, plus referral results if band is given."""
     m = metrics_at(labels, prob_ad, t)
     out = {'setting': name, 'threshold': t, 'n_patients': int(len(labels)),
            'accuracy': m['acc1'] / 100, 'ad_recall': m['ad_recall'], 'nc_recall': m['nc_recall'],
@@ -193,7 +204,8 @@ def summarise(name, labels, prob_ad, t, slice_labels, slice_probs, n_bins, band=
 
 
 def print_row(r):
-    s = (f"  {r['setting']:<34} t={r['threshold']:.2f}  acc {r['accuracy']:.3f}  AD {r['ad_recall']:.3f}  "
+    """Print one row from summarise()."""
+    s =(f"  {r['setting']:<34} t={r['threshold']:.2f}  acc {r['accuracy']:.3f}  AD {r['ad_recall']:.3f}  "
          f"NC {r['nc_recall']:.3f}  F1 {r['macro_f1']:.3f}  NLL {r['nll_patient']:.3f}  "
          f"ECE pat {r['ece_patient']:.3f} slice {r['ece_slice']:.3f}")
     print(s)
@@ -204,6 +216,7 @@ def print_row(r):
 
 
 def main(args):
+    """Fit T, the threshold and the referral band on validation, apply them once to test, and save the results."""
     run_dir = os.path.dirname(os.path.abspath(args.resume))
     out = args.output_dir or os.path.join(run_dir, 'calibrate')
     os.makedirs(out, exist_ok=True)

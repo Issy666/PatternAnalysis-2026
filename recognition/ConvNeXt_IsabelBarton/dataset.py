@@ -1,17 +1,14 @@
 """
-ADNI datasets: train / validation / test folders of <scanID>_<slice>.jpeg slices in AD/ and NC/ class folders.
+ADNI datasets: train / validation / test folders of <scanID>_<slice>.jpeg slices in AD/ and NC/ class folders,
+with optional 2.5D input (neighbouring slices as the 3 channels). The subject-level split itself is made once by
+subject_datasplit.py; the transforms are in normalise.py.
 
 References:
-https://github.com/facebookresearch/ConvNeXt/blob/main/main.py
-https://github.com/MeetRVyas/adni_code/tree/main/docs/assets
-https://github.com/hunghuynh1110/Alzheimers-MRI-ConvNext/blob/main/dataset.py
-https://github.com/slavaheroes/convnext-for-ad/blob/master/dataloaders/datasets.py
-https://github.com/HusnuBarisBaydargil/ConvNext-Medical-Imaging/blob/main/dataset.py
-https://pmc.ncbi.nlm.nih.gov/articles/PMC12691013/#ref-list1
-https://link.springer.com/chapter/10.1007/978-3-031-14903-0_48
-https://www.biorxiv.org/content/10.1101/2025.07.10.664260v1.full
-https://www.mdpi.com/2075-4418/15/23/2997#Data_Availability_Statement
-https://zenodo.org/records/17084199
+build_dataset is adapted from the official ConvNeXt implementation [2] (Copyright (c) Meta Platforms, Inc. and
+affiliates, MIT licence): https://github.com/facebookresearch/ConvNeXt/blob/main/datasets.py
+
+AI assistance: NeighbourSliceFolder (2.5D input) was scaffolded with Claude (Anthropic), then reviewed and tested by
+me (see README, "Artificial Intelligence Usage Disclosure").
 """
 import os
 from collections import defaultdict
@@ -21,6 +18,7 @@ import normalise
 
 
 def patient_id(path):
+    """Scan ID of a slice from its filename, used to group a scan's 20 slices into one patient-level prediction."""
     # filenames are <scanID>_<sliceID>.jpeg, e.g. 1003730_100.jpeg -> 1003730. The ID is one scan session (ADNI image ID);
     # the code calls it a "patient", but one person scanned at several visits has several IDs (see subject_datasplit.py)
     return os.path.basename(path).split('_')[0]
@@ -41,6 +39,7 @@ class NeighbourSliceFolder(datasets.ImageFolder):
     still line up with dataset.samples in predict.py.
     """
     def __init__(self, root, transform=None, step=1):
+        """Index every slice's neighbours once, so __getitem__ only has to open 3 files."""
         super().__init__(root, transform=transform)
         self.step = step
         # (class dir, scan ID) -> {slice index: path}
@@ -57,6 +56,7 @@ class NeighbourSliceFolder(datasets.ImageFolder):
                 self.neighbours[slices[idx]] = (slices[below], slices[above])
 
     def __getitem__(self, index):
+        """Returns (transformed 3-channel image, class index) for slice `index`."""
         path, target = self.samples[index]
         below, above = self.neighbours[path]
         channels = [Image.open(p).convert('L') for p in (below, path, above)]

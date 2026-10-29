@@ -1,11 +1,17 @@
 """
-Train a model on ADNI (AD vs NC), validating every epoch, then test the best validation checkpoint once.
+Training entry point: train a model on ADNI (AD vs NC), validating every epoch, then test the best validation
+checkpoint once.
 
     python main.py --model convnext_tiny_bn --neighbour_slices True --output_dir ~/Desktop/results/<run> ...
 
-Usually launched through testscripts/run_pipeline.sh, which also checks the data first and analyses the predictions.
+Usually launched through run_pipeline.sh, which also checks the data first and analyses the predictions.
 Writes to --output_dir: checkpoint-<epoch>.pth / checkpoint-best.pth, log.txt (one JSON line per epoch),
 test_results.json and test_predictions.csv.
+
+Reference: adapted from the official ConvNeXt training script [2] (Copyright (c) Meta Platforms, Inc. and
+affiliates, MIT licence): https://github.com/facebookresearch/ConvNeXt/blob/main/main.py
+Changes for ADNI: mixup/CutMix, EMA, fine-tuning and distributed options removed; validation and test splits,
+patient-level validation metrics and the --best_metric checkpoint rule added.
 """
 import argparse
 import datetime
@@ -28,6 +34,7 @@ import utils
 
 
 def str2bool(v):
+    """Parse a True/False command-line value."""
     # argparse's type=bool treats any non-empty string (including "False") as True
     if isinstance(v, bool):
         return v
@@ -39,6 +46,7 @@ def str2bool(v):
 
 
 def get_args_parser():
+    """All training options (model, optimiser, schedule, augmentation, data paths, checkpointing)."""
     parser = argparse.ArgumentParser('ConvNeXt training + evaluation script for MRI AD or CN classification', add_help=False)
 
     parser.add_argument('--batch_size', default=64, type=int,
@@ -127,6 +135,7 @@ def get_args_parser():
 
 
 def val_patient_metrics(dataset, probs):
+    """Patient-level validation metrics: mean P(AD) over each scan's slices, then accuracy / recall / macro-F1."""
     # probs are in dataset.samples order (val loader isn't shuffled); column 0 = P(AD)
     idx_to_class = {v: k for k, v in dataset.class_to_idx.items()}
     slices = [(path, idx_to_class[target], p[0]) for (path, target), p in zip(dataset.samples, probs.tolist())]
@@ -134,6 +143,7 @@ def val_patient_metrics(dataset, probs):
 
 
 def main(args):
+    """Build the data, model, optimiser and schedule; train with validation each epoch; then test the best checkpoint."""
 
     print(args)
 
@@ -147,7 +157,7 @@ def main(args):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    #enables the NVIDIA cuDNN auto-tuner to test multiple convolution algorithms and select the fastest one for your GPU  Works for inputs that are the same size
+    # enables the NVIDIA cuDNN auto-tuner, which tests several convolution algorithms and picks the fastest for this GPU (works because every input is the same size)
     cudnn.benchmark = True
 
     dataset_train = build_dataset(split='train', args=args)
@@ -185,10 +195,10 @@ def main(args):
     model = build_model(args)
     model.to(device)
 
-    #No. OF TRAINABLE PARAMATERS IN THE ENTIRE MODEL
+    # number of trainable parameters in the whole model
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-    # RUn details
+    # run details
     print("Model = %s" % str(model))
     print('number of params:', n_parameters)
 
@@ -234,7 +244,7 @@ def main(args):
     best_score, best_epoch = None, None # (best_metric, -val loss) of checkpoint-best.pth, compared as a tuple
 
     print("Start training for %d epochs" % args.epochs)
-    #start epock timer
+    # start the training timer
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         train_stats = train_one_epoch(
@@ -270,7 +280,7 @@ def main(args):
         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
             f.write(json.dumps(log_stats) + "\n")
 
-    total_time = time.time() - start_time # final epoch time
+    total_time = time.time() - start_time # total training time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
 
