@@ -1,0 +1,7 @@
+recognition/ConvNeXt_IsabelBarton/__pycache__/
+recognition/ConvNeXt_IsabelBarton/optim_factory.py
+recognition/ConvNeXt_IsabelBarton/overnight.log
+recognition/ConvNeXt_IsabelBarton/plot_log.py
+recognition/ConvNeXt_IsabelBarton/run_overnight.sh
+recognition/ConvNeXt_IsabelBarton/stats/
+recognition/ConvNeXt_IsabelBarton/utils.py
