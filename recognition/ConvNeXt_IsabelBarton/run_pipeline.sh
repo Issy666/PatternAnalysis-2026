@@ -44,9 +44,6 @@ log() { echo "[$(date '+%F %T')] $*"; }
 log "run: $NAME -> $OUT"
 "$PYTHON" -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 'No CUDA GPU visible to PyTorch')"
 
-# 1. data check + normalisation (mean/std from the training split only)
-log "step 1/4: checking data and recomputing normalisation stats"
-"$PYTHON" "$SCRIPT_DIR/check_data.py" --data_root "$DATA" --recompute_stats 2>&1 | tee "$OUT/data_check.log"
 
 # 2. train + validate every epoch + test the best checkpoint
 if [ -f "$OUT/test_results.json" ]; then
