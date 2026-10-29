@@ -315,11 +315,10 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 | Case | Scan (subject, year) | Truth -> prediction | What happened | Root cause (diagnosis) |
 |---|---|---|---|---|
-| **A. Confident missed AD** | `1005735` (`003_S_6264`, 2018) | AD -> NC, P(AD) 0.14 | every slice below 0.31; the same person's 2019 scan is also missed (0.27) | **person-level appearance**: this person's brain looks NC-like to the model on every slice and visit, consistent with mild or early-stage atrophy. Grad-CAM sits on the ventricles/corpus callosum, i.e. plausible anatomy that simply did not look abnormal |
-| **B. Confident false alarm** | `959645` (`041_S_6192`, 2018) | NC -> AD, P(AD) 0.87 | 18 of 20 slices called AD; the second scan from the same session (`959644`) gives the same 0.87 | Grad-CAM peaks at the **posterior edge of the brain/cerebellum and partly outside it**, the same hot spot as correct AD predictions (Figure 13): a possible **shortcut on the skull-stripping boundary** rather than atrophy |
-| **C. Repeated false alarm** | `1070417` (`068_S_0127`, 2018) | NC -> AD, P(AD) 0.86 | all 3 of this person's test scans are false alarms | **person-level**: a long-followed ADNI participant (enrolled in ADNI-1) whose anatomy looks AD-like, plausibly age-related atrophy; age is not in the metadata, so this cannot be confirmed. Across the test set, 18 of 71 NC people with several scans have *every* scan flagged |
+| **A. Confident missed AD** | `1005735` (`003_S_6264`, 2018) | AD -> NC, P(AD) 0.14 | every slice below 0.31; the same person's 2019 scan is also missed P(AD) (0.27) | **person-level appearance**: this person's brain looks NC-like to the model on every slice and visit, consistent with mild or early-stage atrophy. Grad-CAM appears to look at relevant locations on the brain. So there was plausible anatomy that did not look abnormal |
+| **B. Confident false alarm** | `959645` (`041_S_6192`, 2018) | NC -> AD, P(AD) 0.87 | 18 of 20 slices called AD; the second scan from the same session (`959644`) gives the same 0.87 | Grad-CAM peaks at the edge of the brain and partly outside it, the same hot spot as correct AD predictions (Figure 13). This might indicate some sort of shortcut (correlated boundary detection with AD) rather than AD symptoms |
+| **C. Repeated false alarm** | `1070417` (`068_S_0127`, 2018) | NC -> AD, P(AD) 0.86 | all 3 of this person's test scans are false alarms | Anatomy looks AD-like, plausibly age-related atrophy; age is not in the metadata, so this cannot be confirmed. Across the test set, 18 of 71 NC people with several scans have every scan flagged (Shortcut = multiple scans could mean likley to have AD, if people with AD usually got multiple scans)|
 | **D. Borderline, correctly referred** | `301063` (`126_S_4494`, 2012) | AD -> NC, P(AD) 0.50 | central slices 0.75–0.90 (AD), outer slices 0.05–0.45 (NC); the mean lands on the boundary | **slice disagreement**: the evidence is in the central slices only; the scan-level mean dilutes it. The referral rule correctly sends this case to a specialist |
-| **E. Out-of-distribution input** (course split) | `985197` | AD -> NC, ~0.95 confident | corrupted orientation and intensity on all slices (Figure 3) | **data quality**: softmax confidence did not flag an input unlike anything in training; removed from the data (Section 3.1) |
 
 ![Grad-CAM examples per outcome](images/gradcam_examples.png)
 
@@ -327,9 +326,9 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 ![Mean Grad-CAM per outcome](images/gradcam_mean.png)
 
-*Figure 13. Mean Grad-CAM per outcome. Correct AD and false alarms share the same posterior hot spot; correct NC predictions focus more centrally (ventricles, corpus callosum).*
+*Figure 13. Mean Grad-CAM per outcome. Correct AD and false alarms share the same frontal hot spot; correct NC predictions focus more centrally*
 
-**Grad-CAM statistics** (`visualise.py`): on average 47% of each heat map lies inside the (filled) brain outline, which covers 24% of the image, a 1.9× enrichment over an evenly spread map; no scan has ≥ 75% inside. Part of the "outside" mass is the 16 × 16-pixel resolution of stage-3 maps bleeding over the brain edge, but the shared posterior hot spot of correct and false AD calls suggests the model also uses the brain's outline. Referred scans have the least focused maps (37% inside).
+**Grad-CAM statistics** (`visualise.py`): on average 47% of each heat map lies inside the (filled) brain outline, which covers 24% of the image. Part of the "outside" mass is the 16 × 16-pixel resolution of stage-3 maps bleeding over the brain edge, but the shared frontal hot spot of correct and false AD calls suggests the model also uses the brain's outline. Referred scans have the least focused maps (37% inside).
 
 ![UMAP of scan-level features](images/umap_scans.png)
 
@@ -339,18 +338,16 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 *Figure 15. The same features per slice: a continuous horseshoe from AD-like to NC-like slices with a mixed band where most slice errors fall; averaging 20 slices per scan sharpens the separation (slice accuracy 76.1% -> scan accuracy 80.5%).*
 
-**Summary of failure modes.** Errors are **person-level** rather than random: a person whose anatomy the model finds AD-like (or NC-like) is misclassified on every slice and every visit, and these errors are confident, so they escape the referral rule. Slice-level disagreement causes the borderline cases, which the referral rule does catch. Out-of-distribution inputs are not flagged by softmax confidence at all.
+**Summary of failure modes.** Errors are **person-level** rather than random: a person whose anatomy the model finds AD-like (or NC-like) is misclassified on every slice and every visit, and these errors are confident, so they are not reffered. Slice-level disagreement causes the borderline cases, which the referral rule does catch.
 
 ### 6.5 Engineering recommendation
 
-For a project manager deciding whether to deploy this as a triage assistant:
+My engineering reccomendations are based on this models performance:
 
-1. **Use the plain CNN, not ConvNeXt, on data of this size.** The 0.39 M-parameter baseline matched ConvNeXt-T in accuracy (82.7% vs 79.4%, not significantly different), calibration and referral performance, at 1/70 of the parameters, ~1/4 of the training time and ~1/6 of the latency. ConvNeXt's ImageNet-scale design choices do not pay off when training from scratch on ~400 people; if ConvNeXt is required, use Nano (same accuracy, half the cost of Tiny).
-2. **Decide per scan, not per slice**, by averaging the 20 slices: +3–6 points accuracy and higher AUROC for every model.
-3. **Calibrate with temperature scaling on held-out data** before trusting the confidence scores (patient ECE roughly halves); keep the decision threshold at 0.5 unless it can be tuned on a much larger validation set (or by cross-validation).
-4. **Operating rule:** automate scans whose calibrated P(AD) is outside ±0.13 of the threshold and refer the rest. On test this referred **16.7%** of ConvNeXt's scans and raised accuracy on the automated 83% from 77.9% to **83.4%**, with **AD recall 0.96** on the kept scans; the baseline under the same rule: 13.9% referred, 87.4% kept accuracy.
-5. **Do not rely on confidence alone for safety.** About half of the errors are confident and person-specific (cases A–C), and corrupted inputs are not flagged (case E). Add an input-quality / out-of-distribution check and a second reader for screen-positive cases.
-6. **Split by subject, never by scan or filename.** The leakage found here inflated validation accuracy by ~17 points and created a strong NC bias; any reported ADNI result should state how repeated visits were handled.
+1. **Use the plain CNN, not ConvNeXt, on data of this size.** The 0.39 M-parameter baseline matched ConvNeXt-T in accuracy (82.7% vs 79.4%, not significantly different), calibration and referral performance, at 1/70 th of the parameters, ~1/4 of the training time and ~1/6 of the latency.
+2. **Decide per scan, not per slice**, by averaging the 20 slices: +3-6 points accuracy and higher AUROC for every model.
+4. **Operating rule:** automate scans whose calibrated P(AD) is outside ±0.13 of the threshold and refer the rest. On test this referred **16.7%** of ConvNeXt's scans and raised accuracy from 77.9% to **83.4%**, with **AD recall 0.96**. The baseline under the same rule: 13.9% referred, 87.4% accuracy.
+5. **Do not rely on confidence alone for safety.** About half of the errors are confident and person-specific (cases A–C). Add an input-quality / out-of-distribution check and a secondary system to detect positive cases.
 
 ---
 
@@ -361,32 +358,21 @@ For a project manager deciding whether to deploy this as a triage assistant:
 | File | Purpose |
 |---|---|
 | `modules.py` | the models: `ConvNeXt` (LayerNorm, as in the paper), `ConvNeXtBN` (BatchNorm + head dropout), `SimpleCNN` (baseline), the `--model` registry and `build_model` |
-| `dataset.py` | `build_dataset` (train/val/test `ImageFolder`s with the right transforms), `NeighbourSliceFolder` (2.5D input), `patient_id` |
+| `dataset.py` | `build_dataset` (train/val/test `ImageFolder`s with the right transforms), `NeighbourSliceFolder` |
 | `normalise.py` | `PadToSquare`, training-set mean/std (cached in `stats/`), train and eval transforms |
-| `subject_datasplit.py` | leakage-free train/validation/test split by ADNI subject (Section 3.3) |
 | `train.py` | AdamW optimiser, `train_one_epoch`, `evaluate`, AD/NC metrics |
 | `main.py` | training entry point: trains, validates every epoch, saves checkpoints, tests the best checkpoint |
 | `predict.py` | runs a trained checkpoint on the test set or analyses saved predictions: patient-level metrics, confusion matrix, ROC, calibration, reject curve, example predictions |
-| `calibrate.py` | temperature scaling, validation-chosen threshold and referral rule (Section 6.2) |
-| `visualise.py` | Grad-CAM and UMAP (Section 6.4) |
-| `utils.py` | logging, AMP loss scaler, learning-rate schedule, checkpoint saving/resuming/loading |
-| `../../testscripts/run_pipeline.sh` | one complete run: data check -> training -> test -> analysis -> plots |
-| `../../testscripts/check_data.py` | data checks and leakage checks (filename IDs and ADNI subjects), recomputes normalisation statistics |
-| `../../testscripts/compare_runs.py` | scan-level summaries, paired bootstrap comparisons between runs or ensembles, failure analysis, seen-vs-new-person breakdown |
-| `../../testscripts/benchmark.py` | resource profile: parameters, VRAM, training time, GPU/CPU latency and throughput (Section 6.3) |
-| `../../testscripts/report_figures.py` | the example input/output and failure-case figures (Figures 11 and 16) |
-| `../../testscripts/plot_log.py` | training curves and learning-rate plot from `log.txt` |
-| `../../testscripts/check_scan_era.py` | scan-era confound check (Section 3.2) |
+| `calibrate.py` | temperature scaling, validation-chosen threshold and referral rule
+| `visualise.py` | Grad-CAM and UMAP plots |
+| `utils.py` | logging, learning-rate schedule, checkpoint saving/resuming/loading |
+| `run_pipeline.sh` | one complete run: data check -> training -> test -> analysis -> plots |
+| `report_figures.py` | the example input/output and failure-case figures (Figures 11 and 16) |
+| `plot_log.py` | training curves and learning-rate plot from `log.txt` |
 
 ### 7.2 Running
 
-**1. Create the subject-level split** (once). Copy the course's `ADNI/AD_NC/{train,test}` images into one `train/` folder with `AD/` and `NC/` subfolders, next to `meta_data_with_label.json`, then:
-
-```bash
-python subject_datasplit.py --root ~/Desktop/data/ADNI_patientleakagefix/AD_NC \
-    --meta ~/Desktop/data/ADNI_patientleakagefix/meta_data_with_label.json --val 10 --test 30 --dry-run
-# check the summary, then run again without --dry-run to move the files
-```
+**1. Create the subject-level split** (once).
 
 **2. Train and test the final model** (≈ 15 min on an RTX 3080):
 
@@ -401,30 +387,30 @@ NAME=bn_25d_aug_e18 nohup ./run_pipeline.sh \
 tail -f ~/Desktop/results/bn_25d_aug_e18/train.log
 ```
 
-Swap `--model` for `simple_cnn` (baseline), `convnext_nano_bn` or `convnext_tiny`, and `--seed` for 1 or 2 to reproduce the other runs. Re-running the same `NAME` resumes from the last checkpoint; `QUICK=1 ./run_pipeline.sh` is a one-epoch smoke test.
+Swap `--model` for `simple_cnn` (baseline), `convnext_nano_bn` or `convnext_tiny`, and `--seed` for 1 or 2 to reproduce the other runs. `QUICK=1 ./run_pipeline.sh` is a one-epoch smoke test.
 
 **3. Calibrate, then visualise:**
 
 ```bash
 cd ../recognition/ConvNeXt_IsabelBarton
-python calibrate.py --resume ~/Desktop/results/bn_25d_aug_e18/checkpoint-best.pth
-python visualise.py --resume ~/Desktop/results/bn_25d_aug_e18/checkpoint-best.pth
+python calibrate.py --resume filelocation/checkpoint-best.pth
+python visualise.py --resume filelocation/checkpoint-best.pth
 ```
 
-**4. Test a trained model again / analyse predictions** (works on a CPU):
+**4. Test a trained model again / analyse predictions**:
 
 ```bash
-python predict.py --resume ~/Desktop/results/bn_25d_aug_e18/checkpoint-best.pth       # re-runs the model
-python predict.py --predictions ~/Desktop/results/bn_25d_aug_e18/test_predictions.csv  # analysis only, seconds
+python predict.py --resume filelocation/checkpoint-best.pth       # re-runs the model
+python predict.py --predictions filelocation/test_predictions.csv  # analysis 
 ```
 
-Every script rebuilds the model and its data from the arguments stored in the checkpoint, so nothing about the run has to be repeated on the command line. `python main.py --help` lists all training options (model, learning rate, epochs, augmentation strengths, data paths, 2.5D input, checkpoint metric).
+Every script rebuilds the model and its data from the arguments stored in the checkpoint, so nothing about the run has to be repeated on the command line. `python main.py --help` lists all training options (model, learning rate, epochs, augmentation strengths, data paths, checkpoint metric).
 
 ### 7.3 Example inputs and outputs
 
 ![Example input and output](images/example_input_output.png)
 
-*Figure 16. Input: three neighbouring slices of a test scan become the R, G and B channels of one padded, normalised 3 × 256 × 256 tensor. Output: P(AD) for each of the scan's 20 slices; their mean (0.85) gives the diagnosis AD (correct). Made by `testscripts/report_figures.py`.*
+*Figure 16. Input: three neighbouring slices of a test scan become the R, G and B channels of one padded, normalised 3 × 256 × 256 tensor. Output: P(AD) for each of the scan's 20 slices; their mean (0.85) gives the diagnosis AD (correct). Made by `report_figures.py`.*
 
 A run writes to its output folder:
 
@@ -438,16 +424,7 @@ A run writes to its output folder:
 | `training_curves.png`, `lr_schedule.png` | training plots |
 | `calibrate/`, `visualise/` | calibration results and Grad-CAM / UMAP figures |
 
-Example `test_predictions.csv` rows and the console summary of `predict.py` for the final model:
 
-```
-path,label,pred,prob_AD,prob_NC
-.../AD_NC/test/AD/1003730_100.jpeg,AD,NC,0.051654,0.948346
-
-Patient level (462 patients, mean prob_AD over slices, threshold 0.5)
-  accuracy 80.52%   AD recall 0.921   NC recall 0.694   macro-F1 0.803
-  TP 209  FN 18  FP 72  TN 163
-```
 
 ---
 
@@ -455,45 +432,23 @@ Patient level (462 patients, mean prob_AD over slices, threshold 0.5)
 
 ### 8.1 Dependencies
 
-Tested with these exact versions on Linux (kernel 7.0), NVIDIA driver 580.178.04, CUDA 13.0, one RTX 3080 (10 GB):
+Tested with Linux (kernel 7.0), NVIDIA driver 580.178.04, CUDA 13.0, one RTX 3080 (10 GB):
 
 | Package | Version | Used for |
 |---|---|---|
 | Python | 3.14.8 | |
-| PyTorch | 2.14.1+cu130 (cuDNN 9.24) | models, training |
-| torchvision | 0.29.1+cu130 | datasets, transforms |
-| timm | 1.0.30 | `DropPath`, `trunc_normal_`, label-smoothing loss, random erasing, `accuracy` |
-| NumPy | 2.5.4 | statistics, schedules (not used by the model) |
+| PyTorch | 2.14.1| models, training |
+| torchvision | 0.29.1 | datasets, transforms |
+| timm | 1.0.30 | `DropPath`, label-smoothing loss, random erasing, `accuracy` |
+| NumPy | 2.5.4 | statistics, schedules |
 | Pillow | 13.0.0 | image loading |
 | matplotlib | 3.11.2 | plots |
-| umap-learn | 0.5.12 (with scikit-learn 1.9.1, numba 0.68.0) | UMAP only (`visualise.py`) |
+| umap-learn | 0.5.12 (with scikit-learn 1.9.1, numba 0.68.0) | UMAP only |
 
 ```bash
 pip install torch==2.14.1 torchvision==0.29.1 --index-url https://download.pytorch.org/whl/cu130
 pip install timm==1.0.30 numpy==2.5.4 pillow==13.0.0 matplotlib==3.11.2 umap-learn==0.5.12
 ```
-
-Training needs a CUDA GPU (it always uses mixed precision); `predict.py`, `calibrate.py` and `visualise.py` also run on a CPU.
-
-### 8.2 Reproducibility
-
-- **Data:** the split is deterministic (`subject_datasplit.py --seed 42`) and fully recorded in `split_manifest.csv`; normalisation statistics come from the training split only.
-- **Seeds:** `--seed` fixes PyTorch and NumPy; but `cudnn.benchmark` and mixed precision make GPU training non-deterministic, so a rerun with the same seed gives slightly different numbers. The spread between seeds is therefore reported instead of a single run: patient accuracy 77.3–80.5% over seeds 0–2 (Section 5.2).
-- **Evaluation:** every analysis script rebuilds the model from the checkpoint's stored arguments, and given the same `test_predictions.csv` all analyses (patient metrics, calibration, ROC, reject curve, Grad-CAM statistics, UMAP with a fixed seed) are exactly reproducible. Re-running a checkpoint reproduces its test probabilities to within 3 × 10⁻⁵ (mixed-precision rounding).
-- **Uncertainty:** with 210 test people, accuracy has a margin of about ±5.5 points; model comparisons use paired bootstrap intervals over people.
-- **Commands:** Section 7.2 reproduces every reported run (run names match the tables); the comparisons, failure analysis, resource table and the two report-only figures are reproduced by `compare_runs.py`, `benchmark.py` and `report_figures.py` in `testscripts/` (the figures byte-for-byte).
-
----
-
-## 9. Limitations and Future Work
-
-- **Test-set reuse during development.** Development choices (BatchNorm, 2.5D, augmentation, Tiny vs Nano) were compared on the test set as well as on validation, and Tiny was kept over Nano for its test score. The final numbers are therefore somewhat optimistic. A cleaner protocol is **5-fold cross-validation by subject** on train + validation for every design decision (which also gives a stable threshold and a 5-model ensemble [22]), touching the test set once.
-- **Small validation set** (19 AD people): checkpoint selection and the tuned threshold were noisy; the threshold did not transfer.
-- **Baseline has one seed**; seeds 1–2 (4 min each) would make the comparison symmetric.
-- **Residual confound:** every NC scan is from 2017+, so the scan protocol remains partly predictive of the class; age and disease stage are not available in the metadata, so person-level errors (cases A–C) cannot be attributed to age-related atrophy with certainty.
-- **Label smoothing and referral:** label smoothing (0.1, from the paper) is known to degrade selective classification [11]; it was not ablated here, so the reject-rule results may be improvable without it.
-- **Not tested:** ImageNet-pretrained initialisation (the strongest lever on small medical datasets [5], [17]), EMA/weight averaging, Mixup/CutMix with a long schedule, coordinate attention [7], other MRI planes (coronal slices performed best in [5]), and an explicit out-of-distribution detector for corrupted scans.
-- **Comparability:** the subject-level test set differs from the course test set, so results are not directly comparable with other submissions.
 
 ---
 
@@ -501,15 +456,14 @@ Training needs a CUDA GPU (it always uses mixed precision); `predict.py`, `calib
 
 - **Tool used:** Claude (Anthropic), through the Claude Code command-line assistant.
 - **What it assisted with:**
-  - comparing this implementation with a public reference implementation [4] and with Basereh et al. [5];
-  - scaffolding and refactoring code: the BatchNorm ConvNeXt variant, the 2.5D dataset, the smaller ConvNeXt sizes and baseline CNN, the subject-level split script, `calibrate.py` (temperature scaling, threshold and referral rule), `visualise.py` (Grad-CAM, UMAP), the confusion-matrix/ROC/learning-rate plots, and a final code clean-up;
-  - analysis scripts: the patient-leakage and scan-era investigation from the ADNI metadata, bootstrap confidence intervals and the resource benchmark;
-  - drafting and restructuring this README and condensing the feasibility review.
+  - comparing this implementation with a public reference implementation [2] and with Basereh et al. [5];
+  - scaffolding and refactoring code: the BatchNorm ConvNeXt variant, the 3 channel neighbours, the smaller ConvNeXt sizes and baseline CNN=, `calibrate.py` (temperature scaling, threshold and referral rule), `visualise.py` (Grad-CAM, UMAP), the confusion-matrix/ROC/learning-rate plots, and a final code clean-up;
+  - analysis scripts: the patient-leakage investigation from the ADNI metadata.
+  - Restructuring and formatting this README and condensing the feasibility review.
 - **How it was audited and verified:**
   - every experiment was run by me on my own GPU, and every number in this report was read from the run's own output files (`test_results.json`, `log.txt`, `calibration_results.json`);
-  - data-handling code was checked directly: subject overlap between splits is re-checked on disk after splitting, `check_data.py` validates every split, and the 2.5D dataset was tested to load the correct neighbouring slice files at scan edges;
-  - the code clean-up was verified with a regression test that compared, before and after, the outputs of five trained checkpoints, test-set tensors, the learning-rate schedule, a training step and all analysis outputs (all identical), plus an end-to-end pipeline run and a resume test;
-  - statistical claims use paired bootstrap intervals over people, and results that did not hold up (e.g. the validation-tuned threshold, the second neighbour step) are reported rather than dropped.
+  - After a code clean-up every script was verified visually and by running it and compared with the before and after outputs.
+  - Verified claims by reading academic litreture and reading [1] in depth to fully understand what is required of a convNeXt model. 
 
 ---
 
