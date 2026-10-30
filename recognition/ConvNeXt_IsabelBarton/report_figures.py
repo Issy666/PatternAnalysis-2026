@@ -17,8 +17,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-# the model code lives in recognition/ConvNeXt_IsabelBarton
-CODE_DIR = Path(__file__).resolve().parent.parent / 'recognition' / 'ConvNeXt_IsabelBarton'
+# this script lives next to the model code (recognition/ConvNeXt_IsabelBarton)
+CODE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(CODE_DIR))
 
 import numpy as np

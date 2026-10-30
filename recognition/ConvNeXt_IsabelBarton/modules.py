@@ -7,8 +7,7 @@ References:
     (Copyright (c) Meta Platforms, Inc. and affiliates, MIT licence):
     https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
     Z. Liu et al., "A ConvNet for the 2020s", CVPR 2022 [1]: https://arxiv.org/abs/2201.03545
-    BatchNorm variant motivated by https://github.com/hunghuynh1110/Alzheimers-MRI-ConvNext
-    ConvNeXt-Nano depths/dims from timm [21]: https://github.com/huggingface/pytorch-image-models
+    Stochastic depth (DropPath): G. Huang et al., "Deep networks with stochastic depth", ECCV 2016 [19].
 
 AI assistance: BlockBN, ConvNeXtBN, convnext_nano_bn and SimpleCNN were scaffolded with Claude (Anthropic), then
 reviewed, trained and tested by me (see README, "Artificial Intelligence Usage Disclosure").
@@ -17,7 +16,27 @@ reviewed, trained and tested by me (see README, "Artificial Intelligence Usage D
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from timm.layers import trunc_normal_, DropPath
+from torch.nn.init import trunc_normal_ # same signature and defaults (a=-2, b=2) as timm's trunc_normal_
+
+
+class DropPath(nn.Module):
+    """Stochastic depth [19]: during training, skip a residual branch for a random drop_prob of the samples in the
+    batch, and scale the kept ones by 1 / (1 - drop_prob) so the expected output is unchanged. Identity at eval."""
+    def __init__(self, drop_prob=0.):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        if self.drop_prob == 0. or not self.training:
+            return x
+        keep_prob = 1 - self.drop_prob
+        # one keep/drop decision per sample, shape (N, 1, 1, 1), broadcast over the rest of the tensor
+        mask = x.new_empty((x.shape[0],) + (1,) * (x.ndim - 1)).bernoulli_(keep_prob)
+        return x * mask / keep_prob
+
+    def extra_repr(self):
+        return f'drop_prob={self.drop_prob}'
+
 
 class Block(nn.Module):
     r""" ConvNeXt Block. There are two equivalent implementations:
@@ -142,7 +161,7 @@ class ConvNeXt(nn.Module):
 
         # only Conv2d/Linear; LayerNorms keep weight 1, bias 0 and gamma stays 1e-6
         if isinstance(m, (nn.Conv2d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02) # small random weights break symmetry; truncated at +-2 std so none start too large
+            trunc_normal_(m.weight, std=.02) # small random weights break symmetry; normal(0, 0.02) cut off at +-2, as in the original
             nn.init.constant_(m.bias, 0)
 
     def forward_features(self, x):
@@ -241,12 +260,12 @@ class BlockBN(nn.Module):
 class ConvNeXtBN(nn.Module):
     r""" ConvNeXt with every LayerNorm swapped for BatchNorm, and dropout before the classifier.
         Alternative to ConvNeXt for training from scratch on the small ADNI dataset: the LN model sat at ~50%
-        validation for the first ~16 epochs of convnext_t_scratch, and the BN-based reference repo
-        (hunghuynh1110/Alzheimers-MRI-ConvNext) reports BN trained better for them.
+        validation for the first ~16 epochs of convnext_t_scratch, and BN trained faster and more accurately
+        (README, Section 5.1).
 
     Args:
         same as ConvNeXt, plus
-        head_drop_rate (float): Dropout on the pooled features before the head. Default: 0.4 (as in the reference repo)
+        head_drop_rate (float): Dropout on the pooled features before the head. Default: 0.4
     """
     def __init__(self, in_chans=3, num_classes=1000,
                  depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.1,

@@ -50,17 +50,17 @@ My ConvNeXt is based on the model in [1], and the code was cloned from the offic
 | Initialisation | Pretrained ImageNet training, 300 epochs | 18 epochs | The smaller dataset saw no benifit past 18 epochs and risked overfitting |
 | Augmentation | RandAugment, Mixup, CutMix, flips | small rotations, intensity jitter, random erasing | keep the anatomy and label of each slice intact (Section 3.4) |
 
-The implementation follows the official ConvNeXt code [2] (blocks, drop path, layer scale, AdamW parameter groups, schedules), adapted for ADNI with reference to other ADNI ConvNeXt code [4], [6]; Sources are also cited in the code.
+The implementation follows the official ConvNeXt code [2] (blocks, drop path, layer scale, AdamW parameter groups, schedules), adapted for ADNI with reference to other ADNI ConvNeXt code [6]; Sources are also cited in the code.
 
 The **baseline** (`simple_cnn`) is a plain CNN with four blocks of 3 × 3 conv -> BatchNorm -> ReLU -> 2 × 2 max-pool (32–256 channels), global average pooling, dropout 0.4 and a linear head, totalling 0.39 M parameters.
 
 ---
 
-## Feasibility Review
+## 2. Feasibility Review
 
 *Project 2.1 · ConvNeXt on ADNI (AD vs CN) · Hard difficulty*
 
-### 1. User Need, Scope & Acceptance Criteria
+### 2.1 User Need, Scope & Acceptance Criteria
 **Users:** clinicians (screening aid) and Alzheimer's / medical-imaging ML researchers. **Purpose:** classify 2D T1-weighted brain MRI slices as AD or CN and route low-confidence cases to a specialist. **Open dilemma:** does the model know when it is unsure, or stay overconfident when wrong, compared with a baseline CNN?
 
 | # | Acceptance criterion | Test |
@@ -71,13 +71,13 @@ The **baseline** (`simple_cnn`) is a plain CNN with four blocks of 3 × 3 conv -
 | 4 | Uses anatomy, not shortcuts | Grad-CAM focuses on the brain, not the background or border |
 | 5 | Resource: fits one RTX 3080 (10 GB) | Peak training VRAM < 10 GB; one run < 12 h; latency and parameters vs baseline |
 
-### 2. Model Choice & Course Concepts
+### 2.2 Model Choice & Course Concepts
 - **Data:** course ADNI subset, 1,526 patients x 20 sagittal 256×240 slices, ~48% AD. Split by patient: train 915, validation 161 (15%), test 450 (used once). Greyscale -> 3 channels, padded to 256², training-set mean/std normalisation.
 - **Architecture:** ConvNeXt-T [1] (blocks 3-3-9-3, channels 96–768, 27.8 M parameters): 4×4 patchify stem; blocks of 7x7 depthwise conv -> LayerNorm -> 1x1 conv x4 -> GELU -> 1x1 conv, with layer scale, drop path and residual; pooled -> 2-way linear head, softmax = confidence. Paper training settings where possible (AdamW, wd 0.05, warmup + cosine LR, label smoothing 0.1), batch 4096 -> 64 with LR scaled.
 - **Course concepts:** convolution's inductive biases (locality, translation equivariance) fit atrophy, which appears as local shapes at shifting positions, and need less data than a ViT for ~1,500 patients. Strided downsampling builds hierarchical features (edges -> ventricles, cortex); stochastic depth, weight decay and normalisation limit overfitting.
 - **Literature:** ConvNeXt-T beats Swin-T on ImageNet (82.1% vs 81.3%) as a pure CNN [1], so 0.80 is plausible. Mixup/CutMix blend two brains, so they will be tested on and off.
 
-### 3. Preliminary Feasibility Evidence
+### 2.3 Preliminary Feasibility Evidence
 **Data audit:** 20 slices per patient, all 256x240, no patient in more than one split. **Smoke test:** official ConvNeXt code [2] with an ADNI loader, ImageNet-pretrained ConvNeXt-T fine-tuned on CPU (128², 11 epochs, batch 64, LR 1e-4).
 
 | Measurement | Result | Measurement | Result |
@@ -88,7 +88,7 @@ The **baseline** (`simple_cnn`) is a plain CNN with four blocks of 3 × 3 conv -
 
 The pipeline works end to end (validation loss 0.42 -> 0.20). Test accuracy is below target with a large validation–test gap, and most errors are missed AD (failing acceptance criterion 2). Grad-CAM often highlights the ventricles and medial temporal lobe, but sometimes the border (possible shortcut).
 
-### 4. Risks, Budget & Fallback
+### 2.4 Risks, Budget & Fallback
 - **Risks -> mitigations:** 
 *long training* (CPU ~5 h for 11 epochs) -> GPU with mixed precision, short runs first, epochs tuned on validation (50–100). 
 *Below 0.80, biased against AD* -> 256² input, patient-level averaging of 20 slices, validation-chosen threshold favouring AD recall. 
@@ -129,8 +129,8 @@ On NC, people seen in training scored 0.99 and new people 0.88. The model was la
 | train | NC | 470 | 9,400 |
 | validation | AD | 72 | 1,440 |
 | validation | NC | 78 | 1,560 | 
-| test | AD | 227 | 4,540 | 68 | 
-| test | NC | 235 | 4,700 | 142 | 
+| test | AD | 227 | 4,540 |
+| test | NC | 235 | 4,700 |
 
 **What it changed** (LayerNorm ConvNeXt-T with identical settings on different dataset splits):
 
@@ -313,7 +313,7 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 ![Failure cases with Grad-CAM and per-slice P(AD)](images/failure_cases.png)
 
-*Figure 11. Four representative failures of ConvNeXt-T seed 0 (left: middle slice with Grad-CAM [13] for the predicted class, stage 3; right: P(AD) of each of the scan's 20 slices, dashed line = 0.5, solid line = scan mean). Made by `report_figures.py`; the case details and person-level statistics below come from `testscripts/compare_runs.py RUN --failures`.*
+*Figure 11. Four representative failures of ConvNeXt-T seed 0 (left: middle slice with Grad-CAM [13] for the predicted class, stage 3; right: P(AD) of each of the scan's 20 slices, dashed line = 0.5, solid line = scan mean). Made by `report_figures.py`.*
 
 | Case | Scan (subject, year) | Truth -> prediction | What happened | Root cause (diagnosis) |
 |---|---|---|---|---|
@@ -462,7 +462,7 @@ Tested with Linux (kernel 7.0), NVIDIA driver 580.178.04, CUDA 13.0, one RTX 308
 | Python | 3.14.8 | |
 | PyTorch | 2.14.1| models, training |
 | torchvision | 0.29.1 | datasets, transforms |
-| timm | 1.0.30 | `DropPath`, label-smoothing loss, random erasing, `accuracy` |
+| timm | 1.0.30 | label-smoothing loss, random erasing|
 | NumPy | 2.5.4 | statistics, schedules |
 | Pillow | 13.0.0 | image loading |
 | matplotlib | 3.11.2 | plots |
