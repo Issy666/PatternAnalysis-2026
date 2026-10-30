@@ -163,7 +163,7 @@ All transforms are in `normalise.py`; the dataset classes are in `dataset.py`.
 
 ## 4. Training
 
-`main.py` trains with `train.py` (training, validation, testing and checkpointing), validating every epoch and testing the best validation checkpoint once at the end. `testscripts/run_pipeline.sh` wraps the whole run.
+`main.py` trains with `train.py` (training, validation, testing and checkpointing), validating every epoch and testing the best validation checkpoint once at the end (see Section 7.2 for the commands).
 
 | Setting | Final value | Reason |
 |---|---|---|
@@ -311,7 +311,7 @@ All models comfortably meet the resource criterion, but ConvNeXt-T costs **~70x 
 
 ![Failure cases with Grad-CAM and per-slice P(AD)](images/failure_cases.png)
 
-*Figure 11. Four representative failures of ConvNeXt-T seed 0 (left: middle slice with Grad-CAM [13] for the predicted class, stage 3; right: P(AD) of each of the scan's 20 slices, dashed line = 0.5, solid line = scan mean). Made by `testscripts/report_figures.py`; the case details and person-level statistics below come from `testscripts/compare_runs.py RUN --failures`.*
+*Figure 11. Four representative failures of ConvNeXt-T seed 0 (left: middle slice with Grad-CAM [13] for the predicted class, stage 3; right: P(AD) of each of the scan's 20 slices, dashed line = 0.5, solid line = scan mean). Made by `report_figures.py`; the case details and person-level statistics below come from `testscripts/compare_runs.py RUN --failures`.*
 
 | Case | Scan (subject, year) | Truth -> prediction | What happened | Root cause (diagnosis) |
 |---|---|---|---|---|
@@ -366,42 +366,61 @@ My engineering recommendations, based on this model's performance, are:
 | `calibrate.py` | temperature scaling, validation-chosen threshold and referral rule |
 | `visualise.py` | Grad-CAM and UMAP plots |
 | `utils.py` | logging, learning-rate schedule, checkpoint saving/resuming/loading |
-| `run_pipeline.sh` | one complete run: data check -> training -> test -> analysis -> plots |
+| `subject_datasplit.py` | the leakage-free, subject-level train/validation/test split (run once) |
 | `report_figures.py` | the example input/output and failure-case figures (Figures 11 and 16) |
 | `plot_log.py` | training curves and learning-rate plot from `log.txt` |
 
 ### 7.2 Running
 
-**1. Create the subject-level split** (once).
-
-**2. Train and test the final model** (≈ 15 min on an RTX 3080):
+All commands are run from this folder (`recognition/ConvNeXt_IsabelBarton`). Set the data and output locations once:
 
 ```bash
-cd ../../testscripts
-NAME=bn_25d_aug_e18 nohup ./run_pipeline.sh \
+DATA=~/data/ADNI/AD_NC                 # folder containing train/, validation/ and test/
+META=~/data/ADNI/meta_data_with_label.json
+OUT=~/results/bn_25d_aug_e18           # one new folder per run
+```
+
+**1. Create the subject-level split** (once). Put every image in `$DATA/train/AD` and `$DATA/train/NC`, leave `validation/` and `test/` empty, preview the split, then run it for real (files are moved, and a `split_manifest.csv` is written):
+
+```bash
+python subject_datasplit.py --root $DATA --meta $META --val 10 --test 30 --dry-run   # preview only
+python subject_datasplit.py --root $DATA --meta $META --val 10 --test 30             # move the files
+```
+
+**2. Train and test the final model** (≈ 15 min on an RTX 3080; needs a CUDA GPU). `main.py` trains, validates every epoch, saves `checkpoint-best.pth` and tests it once at the end:
+
+```bash
+mkdir -p $OUT
+python main.py \
+    --data_path $DATA/train --val_data_path $DATA/validation --eval_data_path $DATA/test \
+    --output_dir $OUT \
     --model convnext_tiny_bn --neighbour_slices True \
     --epochs 18 --warmup_epochs 3 --drop_path 0.3 \
     --affine_degrees 15 --affine_translate 0.08 --affine_scale 0.1 \
     --brightness 0.3 --contrast 0.3 \
-    --best_metric patient_macro_f1 --seed 0 > ~/Desktop/results/bn_25d_aug_e18.log 2>&1 &
-tail -f ~/Desktop/results/bn_25d_aug_e18/train.log
+    --best_metric patient_macro_f1 --seed 0 2>&1 | tee $OUT/train.log
 ```
 
-Swap `--model` for `simple_cnn` (baseline), `convnext_nano_bn` or `convnext_tiny`, and `--seed` for 1 or 2 to reproduce the other runs. `QUICK=1 ./run_pipeline.sh` is a one-epoch smoke test.
+Swap `--model` for `simple_cnn` (baseline), `convnext_nano_bn` or `convnext_tiny`, and `--seed` for 1 or 2, to reproduce the other runs. For a quick smoke test, add `--epochs 1 --warmup_epochs 0` with a new `--output_dir`. If a run's `--output_dir` already holds checkpoints, `main.py` resumes from the latest one, so use a new folder for every run.
 
-**3. Calibrate, then visualise:**
+**3. Analyse the test predictions and plot the training curves:**
 
 ```bash
-cd ../recognition/ConvNeXt_IsabelBarton
-python calibrate.py --resume filelocation/checkpoint-best.pth
-python visualise.py --resume filelocation/checkpoint-best.pth
+python predict.py --predictions $OUT/test_predictions.csv --output_dir $OUT   # patient level, confusion matrix, ROC, calibration, reject curve
+python plot_log.py $OUT                                                         # training curves and learning-rate schedule
 ```
 
-**4. Test a trained model again / analyse predictions**:
+**4. Calibrate, then visualise:**
 
 ```bash
-python predict.py --resume filelocation/checkpoint-best.pth       # re-runs the model
-python predict.py --predictions filelocation/test_predictions.csv  # analysis 
+python calibrate.py --resume $OUT/checkpoint-best.pth   # temperature, threshold and referral rule (into $OUT/calibrate)
+python visualise.py --resume $OUT/checkpoint-best.pth   # Grad-CAM and UMAP (into $OUT/visualise)
+```
+
+**5. Test a trained model again** (re-runs the model on the test set, into `$OUT/predict`; works on a CPU):
+
+```bash
+python predict.py --resume $OUT/checkpoint-best.pth
 ```
 
 Every script rebuilds the model and its data from the arguments stored in the checkpoint, so nothing about the run has to be repeated on the command line. `python main.py --help` lists all training options (model, learning rate, epochs, augmentation strengths, data paths, checkpoint metric).

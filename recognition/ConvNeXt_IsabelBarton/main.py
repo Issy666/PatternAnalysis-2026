@@ -4,7 +4,8 @@ checkpoint once.
 
     python main.py --model convnext_tiny_bn --neighbour_slices True --output_dir ~/Desktop/results/<run> ...
 
-Usually launched through run_pipeline.sh, which also checks the data first and analyses the predictions.
+Afterwards, predict.py --predictions <output_dir>/test_predictions.csv analyses the test predictions and
+plot_log.py <output_dir> plots the training curves (see README, Section 7.2).
 Writes to --output_dir: checkpoint-<epoch>.pth / checkpoint-best.pth, log.txt (one JSON line per epoch),
 test_results.json and test_predictions.csv.
 
